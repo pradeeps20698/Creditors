@@ -159,6 +159,26 @@ def load_data() -> pd.DataFrame:
     return df
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def last_data_update():
+    """Last successful swift_party_ref sync (from api_execution_log), as IST.
+
+    executed_at is stored in UTC, so shift +5:30 for India Standard Time.
+    Returns None if the log has no successful run yet.
+    """
+    q = (
+        "SELECT MAX(executed_at) AS ts FROM api_execution_log "
+        "WHERE api_name = 'swift_party_ref' AND status = 'SUCCESS'"
+    )
+    try:
+        ts = pd.to_datetime(pd.read_sql(q, get_engine())["ts"].iloc[0])
+    except Exception:
+        return None
+    if pd.isna(ts):
+        return None
+    return ts + pd.Timedelta(hours=5, minutes=30)
+
+
 AGING_ORDER = ["Not due", "1-30 days", "31-60 days", "61-90 days", "90+ days", "No due date"]
 PERIOD_START = pd.Timestamp("2025-04-01")  # dashboard covers Apr 2025 -> today (no FY split)
 
@@ -193,10 +213,15 @@ st.markdown(
     "<h1 style='text-align:center;'>📊 Swift Creditors/Debtors Dashboard</h1>",
     unsafe_allow_html=True,
 )
+_updated = last_data_update()
+_updated_txt = (
+    f"data updated {_updated:%d %b %Y, %I:%M %p} IST" if _updated is not None
+    else "update time unavailable"
+)
 st.markdown(
     "<p style='text-align:center; color:#8b949e; font-size:0.9rem; margin-top:-0.5rem;'>"
     f"Source: <code>swift_party_ref</code> · {len(data):,} reference rows · "
-    f"data as of {TODAY:%d %b %Y}</p>",
+    f"{_updated_txt}</p>",
     unsafe_allow_html=True,
 )
 
@@ -449,7 +474,7 @@ def render_ledger(acct_all: pd.DataFrame, sign: str, key: str) -> None:
         fit_columns_on_grid_load=True,
         update_on=["filterChanged", "sortChanged"],
         data_return_mode="filtered_and_sorted",
-        custom_css=AG_DARK_VARS,
+        custom_css=AG_DARK_CSS,  # centred blue headers, same as other tables
         key=f"ledger_grid_{key}",
     )
     # Metric cards read from the SAME source as the pinned TOTAL row (acct_display),
