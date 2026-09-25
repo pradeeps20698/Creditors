@@ -33,7 +33,8 @@ AG_DARK_VARS = {
         "--ag-data-color": "#fafafa",
         "--ag-header-background-color": "#161b22",
         "--ag-header-foreground-color": "#4aa3ff",
-        "--ag-odd-row-background-color": "#161b22",
+        # Uniform navy background — no odd/even row striping.
+        "--ag-odd-row-background-color": "#0e1117",
         "--ag-row-hover-color": "rgba(74,163,255,0.12)",
         "--ag-border-color": "#30363d",
         "--ag-row-border-color": "#21262d",
@@ -41,6 +42,16 @@ AG_DARK_VARS = {
         # Vertical divider line between every column.
         "--ag-cell-horizontal-border": "solid 1px #21262d",
         "background-color": "#0e1117",
+    },
+    # Pinned (Account Name) column: keep it transparent so the row's own
+    # background shows through — matches the navy body and preserves the amber
+    # "no credit" / TOTAL row highlights that getRowStyle paints on the row.
+    ".ag-pinned-left-cols-container, .ag-pinned-right-cols-container": {
+        "background-color": "transparent",
+    },
+    ".ag-pinned-left-cols-container .ag-cell, "
+    ".ag-pinned-right-cols-container .ag-cell": {
+        "background-color": "transparent",
     },
 }
 # Full backstop = dark base + the centred blue header styling the aging/OEM
