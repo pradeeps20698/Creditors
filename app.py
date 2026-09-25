@@ -43,15 +43,18 @@ AG_DARK_VARS = {
         "--ag-cell-horizontal-border": "solid 1px #21262d",
         "background-color": "#0e1117",
     },
-    # Pinned (Account Name) column: keep it transparent so the row's own
+    # Pinned (Account Name) column: AG Grid tints the pinned region grey. Force
+    # the pinned containers and their cells transparent so the row's own
     # background shows through — matches the navy body and preserves the amber
     # "no credit" / TOTAL row highlights that getRowStyle paints on the row.
-    ".ag-pinned-left-cols-container, .ag-pinned-right-cols-container": {
-        "background-color": "transparent",
+    # !important is required to beat AG Grid's own cell/container background.
+    ".ag-pinned-left-cols-container, .ag-pinned-right-cols-container, "
+    ".ag-pinned-left-header, .ag-pinned-right-header": {
+        "background-color": "transparent !important",
     },
     ".ag-pinned-left-cols-container .ag-cell, "
     ".ag-pinned-right-cols-container .ag-cell": {
-        "background-color": "transparent",
+        "background-color": "transparent !important",
     },
 }
 # Full backstop = dark base + the centred blue header styling the aging/OEM
