@@ -43,6 +43,14 @@ AG_DARK_VARS = {
         "--ag-cell-horizontal-border": "solid 1px #21262d",
         "background-color": "#0e1117",
     },
+    # Kill the odd/even row striping so every row is the same navy. The
+    # streamlit AgGrid theme paints .ag-row-odd with its own rule that beats the
+    # CSS variable, so target the row classes directly with higher specificity.
+    # No !important, so getRowStyle inline highlights (amber, TOTAL) still win.
+    ".ag-root-wrapper .ag-row.ag-row-odd, "
+    ".ag-root-wrapper .ag-row.ag-row-even": {
+        "background-color": "#0e1117",
+    },
     # Pinned (Account Name) column: AG Grid tints the pinned region grey. Force
     # the pinned containers and their cells transparent so the row's own
     # background shows through — matches the navy body and preserves the amber
