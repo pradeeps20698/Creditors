@@ -18,6 +18,38 @@ from st_aggrid import AgGrid, GridOptionsBuilder, JsCode
 load_dotenv()
 
 # --------------------------------------------------------------------------- #
+# AgGrid dark-theme backstop
+# --------------------------------------------------------------------------- #
+# `theme="streamlit"` follows whatever theme the viewer resolves to, so a viewer
+# whose browser is set to Light gets light grids even though config.toml pins a
+# dark default. These overrides repaint the AG Grid base dark via its own CSS
+# variables, so every table looks identical (dark) for all viewers. Variables
+# only set defaults, so inline row styles from getRowStyle (amber "no credit"
+# rows, grey/blue TOTAL rows) still win and keep their highlight colours.
+AG_DARK_VARS = {
+    ".ag-root-wrapper": {
+        "--ag-background-color": "#0e1117",
+        "--ag-foreground-color": "#fafafa",
+        "--ag-data-color": "#fafafa",
+        "--ag-header-background-color": "#161b22",
+        "--ag-header-foreground-color": "#4aa3ff",
+        "--ag-odd-row-background-color": "#161b22",
+        "--ag-row-hover-color": "rgba(74,163,255,0.12)",
+        "--ag-border-color": "#30363d",
+        "--ag-row-border-color": "#21262d",
+        "--ag-secondary-border-color": "#21262d",
+        "background-color": "#0e1117",
+    },
+}
+# Full backstop = dark base + the centred blue header styling the aging/OEM
+# tables already used.
+AG_DARK_CSS = {
+    **AG_DARK_VARS,
+    ".ag-header-cell-label": {"justify-content": "center"},
+    ".ag-header-cell-text": {"color": "#4aa3ff", "font-weight": "700"},
+}
+
+# --------------------------------------------------------------------------- #
 # Config
 # --------------------------------------------------------------------------- #
 st.set_page_config(
@@ -381,6 +413,7 @@ def render_ledger(acct_all: pd.DataFrame, sign: str, key: str) -> None:
         fit_columns_on_grid_load=True,
         update_on=["filterChanged", "sortChanged"],
         data_return_mode="filtered_and_sorted",
+        custom_css=AG_DARK_VARS,
         key=f"ledger_grid_{key}",
     )
     # Metric cards read from the SAME source as the pinned TOTAL row (acct_display),
@@ -584,11 +617,7 @@ def render_aging_ledger(rows: pd.DataFrame, key: str,
         fit_columns_on_grid_load=True,
         update_on=["filterChanged", "sortChanged"],
         data_return_mode="filtered_and_sorted",
-        custom_css={
-            # Centre every header label and colour the header text (OEM-table format).
-            ".ag-header-cell-label": {"justify-content": "center"},
-            ".ag-header-cell-text": {"color": "#4aa3ff", "font-weight": "700"},
-        },
+        custom_css=AG_DARK_CSS,
         key=f"aging_grid_{key}",
     )
     with metrics_box:
@@ -866,11 +895,7 @@ def render_grouped_aging_ledger(rows: pd.DataFrame, key: str, group_map,
         theme="streamlit",
         allow_unsafe_jscode=True,
         fit_columns_on_grid_load=True,
-        custom_css={
-            # Centre every header label and colour the header text (all columns).
-            ".ag-header-cell-label": {"justify-content": "center"},
-            ".ag-header-cell-text": {"color": "#4aa3ff", "font-weight": "700"},
-        },
+        custom_css=AG_DARK_CSS,
         key=f"grouped_aging_grid_{key}",
     )
 
@@ -989,10 +1014,7 @@ def render_aging_summary(rows: pd.DataFrame, key: str, bins=RECEIVABLE_BINS,
         theme="streamlit",
         allow_unsafe_jscode=True,
         fit_columns_on_grid_load=True,
-        custom_css={
-            ".ag-header-cell-label": {"justify-content": "center"},
-            ".ag-header-cell-text": {"color": "#4aa3ff", "font-weight": "700"},
-        },
+        custom_css=AG_DARK_CSS,
         key=f"aging_summary_{key}",
     )
 
