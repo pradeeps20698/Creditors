@@ -43,6 +43,12 @@ AG_DARK_VARS = {
         "--ag-cell-horizontal-border": "solid 1px #484f58",
         "background-color": "#0e1117",
     },
+    # Explicit vertical divider line between columns. The
+    # --ag-cell-horizontal-border variable is ignored by this theme, so draw a
+    # right border on every body + header cell directly (!important to win).
+    ".ag-cell, .ag-header-cell": {
+        "border-right": "1px solid #484f58 !important",
+    },
     # Kill the odd/even row striping so every row is the same navy. The
     # streamlit AgGrid theme paints .ag-row-odd with its own rule that beats the
     # CSS variable, so target the row classes directly with higher specificity.
