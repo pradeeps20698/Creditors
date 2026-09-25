@@ -83,7 +83,7 @@ AG_DARK_CSS = {
 # Config
 # --------------------------------------------------------------------------- #
 st.set_page_config(
-    page_title="Swift Party Reference Dashboard",
+    page_title="Swift Creditors/Debtors Dashboard",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -189,10 +189,15 @@ _cd_max = (data.assign(_cd=pd.to_numeric(data["credit_days"], errors="coerce"))
            .groupby("account_name")["_cd"].max())
 NO_CREDIT = _cd_max.isna() | (_cd_max <= 0)
 
-st.title("📊 Swift Party Reference Dashboard")
-st.caption(
-    f"Source: `swift_party_ref` · {len(data):,} reference rows · "
-    f"data as of {TODAY:%d %b %Y}"
+st.markdown(
+    "<h1 style='text-align:center;'>📊 Swift Creditors/Debtors Dashboard</h1>",
+    unsafe_allow_html=True,
+)
+st.markdown(
+    "<p style='text-align:center; color:#8b949e; font-size:0.9rem; margin-top:-0.5rem;'>"
+    f"Source: <code>swift_party_ref</code> · {len(data):,} reference rows · "
+    f"data as of {TODAY:%d %b %Y}</p>",
+    unsafe_allow_html=True,
 )
 
 # --------------------------------------------------------------------------- #
