@@ -38,6 +38,8 @@ AG_DARK_VARS = {
         "--ag-border-color": "#30363d",
         "--ag-row-border-color": "#21262d",
         "--ag-secondary-border-color": "#21262d",
+        # Vertical divider line between every column.
+        "--ag-cell-horizontal-border": "solid 1px #21262d",
         "background-color": "#0e1117",
     },
 }
