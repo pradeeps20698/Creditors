@@ -39,8 +39,8 @@ AG_DARK_VARS = {
         "--ag-border-color": "#30363d",
         "--ag-row-border-color": "#21262d",
         "--ag-secondary-border-color": "#21262d",
-        # Vertical divider line between every column.
-        "--ag-cell-horizontal-border": "solid 1px #21262d",
+        # Vertical divider line between every column (light grey, clearly visible).
+        "--ag-cell-horizontal-border": "solid 1px #484f58",
         "background-color": "#0e1117",
     },
     # Kill the odd/even row striping so every row is the same navy. The
@@ -389,6 +389,7 @@ def render_ledger(acct_all: pd.DataFrame, sign: str, key: str) -> None:
     gb = GridOptionsBuilder.from_dataframe(acct_display)
     gb.configure_default_column(
         filter=True, floatingFilter=True, sortable=True, resizable=True,
+        flex=1,  # stretch columns to fill width (no empty gap on the right)
         filterParams={"buttons": ["clear"]},
     )
     inr_fmt = JsCode(
@@ -573,6 +574,7 @@ def render_aging_ledger(rows: pd.DataFrame, key: str,
     gb = GridOptionsBuilder.from_dataframe(piv)
     gb.configure_default_column(
         filter=True, floatingFilter=True, sortable=True, resizable=True,
+        flex=1,  # stretch columns to fill width (no empty gap on the right)
         filterParams={"buttons": ["clear"]},
         cellStyle={"textAlign": "center"},  # centre values (OEM-table format)
     )
@@ -858,6 +860,7 @@ def render_grouped_aging_ledger(rows: pd.DataFrame, key: str, group_map,
     # Sorting/filtering would scramble the group + subtotal layout, so disable them.
     # Centre every cell's value (headers are centred via custom_css below).
     gb.configure_default_column(filter=False, sortable=False, resizable=True,
+                                flex=1,  # stretch columns to fill width (no gap)
                                 cellStyle={"textAlign": "center"})
     inr_fmt = JsCode(
         "function(p){return p.value==null?'':Number(p.value)"
@@ -1008,6 +1011,7 @@ def render_aging_summary(rows: pd.DataFrame, key: str, bins=RECEIVABLE_BINS,
 
     gb = GridOptionsBuilder.from_dataframe(disp)
     gb.configure_default_column(filter=False, sortable=False, resizable=True,
+                                flex=1,  # stretch columns to fill width (no gap)
                                 cellStyle={"textAlign": "center"})
     inr_fmt = JsCode(
         "function(p){return p.value==null?'':Math.round(Number(p.value))"
