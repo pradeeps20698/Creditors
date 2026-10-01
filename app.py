@@ -1908,15 +1908,16 @@ with tab_all:
 
     with right:
         st.subheader("Aging of outstanding")
-        st.caption("Same buckets as the aging summary — Payables (below 0), "
-                   "Receivables (above 0) and Net balance, with the 7-day default.")
+        st.caption("Same buckets and figures as the aging summary table above "
+                   "(classified by AccountType, with the 7-day default).")
         summ, bucket_cols = aging_summary_frame(_summary_src,
                                                 bins=RECEIVABLE_BINS)
         long = summ.melt(id_vars="Type", value_vars=bucket_cols,
                          var_name="Bucket", value_name="Amount")
+        long["label"] = long["Amount"].map(inr)  # Indian Cr/L labels (match the table)
         fig = px.bar(
             long, x="Bucket", y="Amount", color="Type", barmode="group",
-            text_auto=".2s",
+            text="label",
             category_orders={"Bucket": bucket_cols,
                              "Type": ["Payables (we owe)",
                                       "Receivables (owed to us)", "Net balance"]},
@@ -1924,6 +1925,7 @@ with tab_all:
                                 "Receivables (owed to us)": "#3fb950",
                                 "Net balance": "#8b949e"},
         )
+        fig.update_traces(textposition="outside", cliponaxis=False)
         fig.update_layout(height=420, xaxis_title="", legend_title="",
                           legend=dict(orientation="h", y=1.12),
                           margin=dict(l=0, r=0, t=10, b=0))
