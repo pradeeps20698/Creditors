@@ -566,7 +566,8 @@ _acct = df.groupby(["account_name", "account_type"], as_index=False)["bal_amount
 _acct = _acct[_acct["bal_amount"].abs() > 100]  # drop near-zero, same rule as ledger
 _coded = _acct["account_name"].str.contains(CODE_PATTERN, case=False, regex=True)
 _grp = _acct["account_name"].map(lambda n: _kpi_groups.get(_norm_name(n)))
-_grp_l = _grp.map(lambda g: (g or "").strip().lower())
+# NaN-safe: when no groups load (e.g. Group.xlsx/openpyxl missing) _grp is all-NaN.
+_grp_l = _grp.astype("string").fillna("").str.strip().str.lower()
 _is_cl = _acct["account_type"] == "Current Liabilities"
 _is_ca = _acct["account_type"] == "Current Assets"
 # Count a payable account if it's a pump (coded) OR grouped but not Diesel-Control.
