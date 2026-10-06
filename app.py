@@ -216,9 +216,12 @@ def _coll_cell(v) -> str:
     return full if ln == 0 else f"{full} ({_inr_int(ln)} L)"
 
 
-def _collection_xlsx_bytes(disp_df, num_cols) -> bytes:
+def _collection_xlsx_bytes(disp_df, num_cols, detail_df=None) -> bytes:
     """Excel export of the collection report, styled like the on-screen table:
-    numbers right-aligned, the '(N L)' part coloured blue, TOTAL row bold."""
+    numbers right-aligned, the '(N L)' part coloured blue, TOTAL row bold.
+
+    When `detail_df` is given it is written to a second 'Bill Detail' sheet —
+    the bill-no / bill-date / due-date line items backing the summary."""
     import io
     from openpyxl import Workbook
     from openpyxl.cell.rich_text import CellRichText, TextBlock
@@ -259,9 +262,54 @@ def _collection_xlsx_bytes(disp_df, num_cols) -> bytes:
     for ci, col in enumerate(headers, start=1):
         ws.column_dimensions[ws.cell(1, ci).column_letter].width = \
             22 if col == headers[0] else 20
+
+    if detail_df is not None and not detail_df.empty:
+        ws2 = wb.create_sheet("Bill Detail")
+        dheaders = list(detail_df.columns)
+        ws2.append(dheaders)
+        for ci in range(1, len(dheaders) + 1):
+            ws2.cell(1, ci).font = Font(bold=True)
+            ws2.cell(1, ci).alignment = Alignment(horizontal="center")
+        for _, row in detail_df.iterrows():
+            rr = ws2.max_row + 1
+            for ci, col in enumerate(dheaders, start=1):
+                cell = ws2.cell(rr, ci)
+                val = row[col]
+                if col in ("Amount", "Credit Days", "Days Overdue"):
+                    cell.value = None if pd.isna(val) else float(val)
+                    cell.alignment = right
+                else:
+                    cell.value = "" if pd.isna(val) else str(val)
+                    cell.alignment = left
+        for ci, col in enumerate(dheaders, start=1):
+            ws2.column_dimensions[ws2.cell(1, ci).column_letter].width = \
+                26 if col == "Account Name" else 14
+
     bio = io.BytesIO()
     wb.save(bio)
     return bio.getvalue()
+
+
+def _bill_detail_frame(r, accounts, bucket_col, bucket_label, group_header="Group"):
+    """Line-level bills backing an aging/collection table — one row per reference,
+    limited to the `accounts` actually shown above. Columns: group, account, bill
+    no (ref_no), bill date (ref_date), due date, credit days, days overdue, the
+    per-row bucket/week, and the net amount. Sorted by group → account → due date."""
+    d = r[r["account_name"].isin(list(accounts))].copy()
+    d = d.sort_values(["_grp", "account_name", "due_date"])
+    out = pd.DataFrame({
+        group_header: d["_grp"].values,
+        "Account Name": d["account_name"].values,
+        "Bill No": (d["ref_no"].astype("string").fillna("").values
+                    if "ref_no" in d.columns else ""),
+        "Bill Date": d["ref_date"].dt.strftime("%d-%m-%Y").values,
+        "Due Date": d["due_date"].dt.strftime("%d-%m-%Y").values,
+        "Credit Days": pd.to_numeric(d["credit_days"], errors="coerce").values,
+        "Days Overdue": (TODAY - d["due_date"]).dt.days.values,
+        bucket_label: d[bucket_col].astype("string").fillna("").values,
+        "Amount": d["bal_amount"].round(0).values,
+    })
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -815,6 +863,7 @@ def render_aging_ledger(rows: pd.DataFrame, key: str,
         r["account_name"] = r["account_name"].fillna("").map(group_map)
     r["_dtd"] = (r["due_date"] - TODAY).dt.days
     r["_dov"] = (TODAY - r["due_date"]).dt.days
+    r["_grp"] = r["account_name"]  # display grouping (group label when group_map set)
     if sign == "payable":
         # New layout: "Due in coming weeks" + "Advance" + overdue-age buckets.
         r["_bkt"] = r["_dtd"].apply(_bucket_by_due)
@@ -1003,13 +1052,26 @@ def render_aging_ledger(rows: pd.DataFrame, key: str,
                 "Set credit_days for these accounts."
             )
 
-    st.download_button(
-        "⬇️ Download aging ledger (CSV)",
-        piv.drop(columns=["_no_credit", "_ov_tip"]).to_csv(index=False).encode("utf-8"),
-        file_name=f"aging_ledger_{key}.csv",
-        mime="text/csv",
-        key=f"dl_aging_{key}",
-    )
+    acol1, acol2 = st.columns(2)
+    with acol1:
+        st.download_button(
+            "⬇️ Download aging ledger (CSV)",
+            piv.drop(columns=["_no_credit", "_ov_tip"]).to_csv(index=False).encode("utf-8"),
+            file_name=f"aging_ledger_{key}.csv",
+            mime="text/csv",
+            key=f"dl_aging_{key}",
+        )
+    with acol2:
+        _detail = _bill_detail_frame(
+            r, piv[name_header], bucket_col="_bkt",
+            bucket_label="Aging Bucket", group_header="Group")
+        st.download_button(
+            "⬇️ Download bill-wise detail (CSV)",
+            _detail.to_csv(index=False).encode("utf-8"),
+            file_name=f"aging_bills_{key}.csv",
+            mime="text/csv",
+            key=f"dl_aging_bills_{key}",
+        )
 
     # Row-level references for the accounts shown above.
     render_reference_detail(rows, piv[name_header].tolist(), key)
@@ -1412,13 +1474,26 @@ def render_grouped_aging_ledger(rows: pd.DataFrame, key: str, group_map,
             "🔵 Blue rows are per-group subtotals."
         )
 
-    st.download_button(
-        "⬇️ Download grouped aging ledger (CSV)",
-        disp.drop(columns=["_is_total", "_no_credit"]).to_csv(index=False).encode("utf-8"),
-        file_name=f"grouped_aging_ledger_{key}.csv",
-        mime="text/csv",
-        key=f"dl_grouped_aging_{key}",
-    )
+    dcol1, dcol2 = st.columns(2)
+    with dcol1:
+        st.download_button(
+            "⬇️ Download grouped aging ledger (CSV)",
+            disp.drop(columns=["_is_total", "_no_credit"]).to_csv(index=False).encode("utf-8"),
+            file_name=f"grouped_aging_ledger_{key}.csv",
+            mime="text/csv",
+            key=f"dl_grouped_aging_{key}",
+        )
+    with dcol2:
+        _detail = _bill_detail_frame(
+            r, piv["account_name"], bucket_col="_bkt",
+            bucket_label="Aging Bucket", group_header=group_label)
+        st.download_button(
+            "⬇️ Download bill-wise detail (CSV)",
+            _detail.to_csv(index=False).encode("utf-8"),
+            file_name=f"grouped_aging_bills_{key}.csv",
+            mime="text/csv",
+            key=f"dl_grouped_aging_bills_{key}",
+        )
 
     # Row-level references for the accounts shown above.
     render_reference_detail(rows, piv["account_name"].tolist(), key)
@@ -1681,6 +1756,7 @@ def render_collection_report(oem_rows: pd.DataFrame, key: str = "collection") ->
         return min(d // 7, N)   # N -> "Later"
     r["_w"] = r["due_date"].apply(_wk)
     r = r[r["_w"].notna()]
+    r["_w"] = r["_w"].astype(int)
 
     col_keys = list(range(-1, N + 1))   # -1 = Old Collection, 0..N-1 weeks, N = Later
     label_of = {-1: "Old Collection"}
@@ -1747,9 +1823,17 @@ def render_collection_report(oem_rows: pd.DataFrame, key: str = "collection") ->
     st.caption(f"Expected collection by calendar week (Mon–Sun). Overdue amounts fold "
                f"into the current week. Today {TODAY:%d/%m/%Y}.")
     _disp = pd.concat([pd.DataFrame([tot]), piv], ignore_index=True)
+    # Bill-wise detail (bill no / bill date / due date) backing the week forecast,
+    # written to a second sheet of the Excel. "Collection Week" = the week column
+    # each bill falls under above.
+    r["_cwk"] = r["_w"].map(label_of)
+    _shown_accts = r.loc[r["_grp"].isin(order), "account_name"].unique()
+    _detail = _bill_detail_frame(
+        r, _shown_accts, bucket_col="_cwk",
+        bucket_label="Collection Week", group_header="OEM Group")
     st.download_button(
         "⬇️ Download collection report (Excel)",
-        _collection_xlsx_bytes(_disp, num),
+        _collection_xlsx_bytes(_disp, num, detail_df=_detail),
         file_name=f"collection_report_{key}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         key=f"dl_collection_{key}",
