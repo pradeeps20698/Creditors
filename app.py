@@ -194,6 +194,42 @@ def last_data_update():
     return ts + pd.Timedelta(hours=5, minutes=30)
 
 
+# Auto-refresh: poll api_execution_log this often (seconds); when a NEW successful
+# swift_party_ref sync appears, clear caches and rerun so fresh data shows.
+AUTO_REFRESH_SECONDS = 60
+
+
+def _latest_sync_ts_raw():
+    """Latest swift_party_ref SUCCESS executed_at (raw UTC), UNCACHED — used by the
+    auto-refresh watcher to detect a new sync on each poll."""
+    q = (
+        "SELECT MAX(executed_at) AS ts FROM api_execution_log "
+        "WHERE api_name = 'swift_party_ref' AND status = 'SUCCESS'"
+    )
+    try:
+        ts = pd.to_datetime(pd.read_sql(q, get_engine())["ts"].iloc[0])
+    except Exception:
+        return None
+    return None if pd.isna(ts) else ts
+
+
+@st.fragment(run_every=AUTO_REFRESH_SECONDS)
+def _auto_refresh_on_new_sync():
+    """Poll api_execution_log; when the latest successful swift_party_ref sync time
+    changes, clear caches and rerun the whole app to load the new data."""
+    latest = _latest_sync_ts_raw()
+    if latest is None:
+        return
+    key = latest.isoformat()
+    seen = st.session_state.get("_last_sync_seen")
+    if seen is None:
+        st.session_state["_last_sync_seen"] = key          # baseline, no refresh
+    elif key != seen:
+        st.session_state["_last_sync_seen"] = key
+        st.cache_data.clear()
+        st.rerun(scope="app")
+
+
 AGING_ORDER = ["Not due", "1-30 days", "31-60 days", "61-90 days", "90+ days", "No due date"]
 PERIOD_START = pd.Timestamp("2025-04-01")  # dashboard covers Apr 2025 -> today (no FY split)
 
@@ -354,9 +390,12 @@ _updated_txt = (
 st.markdown(
     "<p style='text-align:center; color:#8b949e; font-size:0.9rem; margin-top:-0.5rem;'>"
     f"Source: <code>swift_party_ref</code> · {len(data):,} reference rows · "
-    f"{_updated_txt}</p>",
+    f"{_updated_txt} · 🔄 auto-refreshes on new sync</p>",
     unsafe_allow_html=True,
 )
+
+# Watch api_execution_log and reload automatically when a new sync completes.
+_auto_refresh_on_new_sync()
 
 # --------------------------------------------------------------------------- #
 # Sidebar filters
