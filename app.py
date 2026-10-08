@@ -115,10 +115,25 @@ def get_engine():
     return create_engine(url, pool_pre_ping=True)
 
 
+# Accounts excluded from the whole dashboard (every tab/table/chart). Matched
+# case- and whitespace-insensitively on account_name.
+EXCLUDED_ACCOUNTS = {
+    "gyanti pump control ac agra",
+    "gyanti pump control ac khushinagar",
+    "gyanti multiservices pvt ltd - kushinagar",
+    "gyanti pump control ac kanpur",
+    "gyanti pump control ac krishangiri",
+}
+
+
 @st.cache_data(ttl=600, show_spinner="Loading data from RDS…")
 def load_data() -> pd.DataFrame:
     q = "SELECT * FROM swift_party_ref"
     df = pd.read_sql(q, get_engine())
+    # Drop globally-excluded accounts up front so they never appear anywhere.
+    _norm = df["account_name"].fillna("").str.strip().str.lower().str.replace(
+        r"\s+", " ", regex=True)
+    df = df[~_norm.isin(EXCLUDED_ACCOUNTS)]
     for c in ["ref_date", "due_date", "ref_doe", "created_at", "synced_at", "active_updated_at"]:
         if c in df.columns:
             df[c] = pd.to_datetime(df[c], errors="coerce")
@@ -402,6 +417,23 @@ CODE_PATTERN = r"iocl|bpcl|hpcl"          # oil-marketing-company codes
 FUEL_KW_PATTERN = r"pump|petrol|fuel|filling"
 CONTROL_PATTERN = r"control|slip|puc"
 
+# Extra accounts (no oil-company code) to show INSIDE the Pump Vendors table,
+# grouped under "Cash & Others" after the oil-company groups. Matched exactly on
+# normalised account_name, so e.g. "Cash Pump Volopay" is NOT affected.
+PUMP_EXTRA_ACCOUNTS = {
+    "cash pump",
+    "cash pump omni",
+    "janta service station",
+    "gyanti multiservices pvt ltd",
+}
+
+
+def _is_pump_extra(frame: pd.DataFrame) -> pd.Series:
+    """Rows for the Pump-Vendors 'Cash & Others' group (see PUMP_EXTRA_ACCOUNTS)."""
+    norm = (frame["account_name"].fillna("").str.strip().str.lower()
+            .str.replace(r"\s+", " ", regex=True))
+    return norm.isin(PUMP_EXTRA_ACCOUNTS)
+
 
 @st.cache_data
 def load_enroute_norm() -> set:
@@ -433,7 +465,9 @@ def _is_control_others(frame: pd.DataFrame) -> pd.Series:
     has_code = names.str.contains(CODE_PATTERN, case=False, regex=True)
     is_fuel_kw = names.str.contains(FUEL_KW_PATTERN, case=False, regex=True)
     is_control = names.str.contains(CONTROL_PATTERN, case=False, regex=True)
-    return is_control | (is_fuel_kw & ~has_code)
+    base = is_control | (is_fuel_kw & ~has_code)
+    # Pump-extra accounts (e.g. Cash Pump) are shown in the Pump Vendors table.
+    return base & ~_is_pump_extra(frame)
 
 
 def _is_dedicated(frame: pd.DataFrame) -> pd.Series:
@@ -452,9 +486,23 @@ def _pump_group(name: str) -> str:
     return "Other"
 
 
+def _pump_group_ext(name: str) -> str:
+    """Pump group that also folds the no-code PUMP_EXTRA_ACCOUNTS into a
+    'Cash & Others' group (shown after the oil-company groups)."""
+    g = _pump_group(name)
+    return "Cash & Others" if g == "Other" else g
+
+
 def _norm_name(s) -> str:
     """Case-/whitespace-insensitive key for matching account names."""
     return " ".join(str(s).strip().lower().split())
+
+
+def _party_key(s) -> str:
+    """Looser key for matching a ledger account_name to a cn_data billing_party:
+    _norm_name with punctuation stripped so 'Mahindra Logistics Ltd.' matches
+    'Mahindra Logistics Ltd'."""
+    return re.sub(r"[^a-z0-9 ]+", "", _norm_name(s)).strip()
 
 
 # Pump Vendors "Unbilled" column: each pump account (name carries an oil-company
@@ -568,11 +616,22 @@ def _has_displayable_accounts(sub: pd.DataFrame) -> bool:
     return bool((net.abs() > 100).any())
 
 
+# Manual Payables vendor-group overrides, applied on top of Group.xlsx. Normalised
+# account_name -> group; use to move specific accounts into an existing group
+# without editing the Excel.
+VENDOR_GROUP_OVERRIDES = {
+    "sri hari vishnu motors": "Sundry Creditors",
+    "rajyog motors llp": "Sundry Creditors",
+    "p s auto parts": "Sundry Creditors",
+}
+
+
 @st.cache_data(ttl=600)
 def load_vendor_groups():
     """Load the Payables vendor grouping from Group.xlsx / vendor_groups.csv
     (two columns: Group, Vendor(s) Name). Returns (normalised-name -> group dict,
-    ordered groups). Returns ({}, []) if no file is present (graceful fallback)."""
+    ordered groups). Returns ({}, []) if no file is present (graceful fallback).
+    VENDOR_GROUP_OVERRIDES are applied last so they win over the file."""
     here = os.path.dirname(os.path.abspath(__file__))
     xlsx = os.path.join(here, "Group.xlsx")
     csv = os.path.join(here, "vendor_groups.csv")
@@ -596,6 +655,11 @@ def load_vendor_groups():
         nm = _norm_name(r[ncol])
         if not grp or not nm:
             continue
+        name_to_group[nm] = grp
+        if grp not in order:
+            order.append(grp)
+    # Manual overrides win over the file.
+    for nm, grp in VENDOR_GROUP_OVERRIDES.items():
         name_to_group[nm] = grp
         if grp not in order:
             order.append(grp)
@@ -829,6 +893,30 @@ def _make_bucketer(bins):
     return _bucket
 
 
+CREDIT_DAYS_COL = "Credit days"
+
+
+def _credit_days_label(sub_r: pd.DataFrame, basis: str, default_val) -> str:
+    """Compact label of the credit-days used to derive an account's due date,
+    paired with the "Due date basis" column:
+      Actual  -> the DB credit_days (single value, or 'min–max' if they vary)
+      Default -> the default that was applied (flat or OEM per-group)
+      Mixed   -> 'actual / Nd' (DB value(s) plus the default used where missing)."""
+    cd = pd.to_numeric(sub_r["credit_days"], errors="coerce")
+    actuals = sorted({int(x) for x in cd[(cd.notna()) & (cd > 0)].unique()})
+    a_repr = ("" if not actuals else
+              str(actuals[0]) if len(actuals) == 1 else f"{actuals[0]}–{actuals[-1]}")
+    dv = None if default_val is None else int(default_val)
+    if basis == "Actual":
+        return a_repr
+    if basis == "Default":
+        return "" if dv is None else str(dv)
+    # Mixed: some refs had a DB value, others fell back to the default.
+    if dv is None:
+        return a_repr
+    return f"{a_repr} / {dv}d" if a_repr else f"{dv}d"
+
+
 def render_aging_ledger(rows: pd.DataFrame, key: str,
                         bins=PAYABLE_BINS, sign: str = "payable",
                         group_map=None, name_header: str = "Account Name",
@@ -871,9 +959,9 @@ def render_aging_ledger(rows: pd.DataFrame, key: str,
         tips = _due_soon_tip_by_account(r)   # hover breakdown of upcoming windows
         tip_col = DUE_SOON_COL
     else:
-        # Classic receivable layout: "Overdue" lump + upcoming windows.
+        # Classic receivable layout: "Overdue" lump + "Advance" + upcoming windows.
         r["_bkt"] = r["_dtd"].apply(_make_bucketer(bins))
-        bucket_order = ["Overdue"] + [lbl for lbl, _ in bins]
+        bucket_order = ["Overdue", ADVANCE_COL] + [lbl for lbl, _ in bins]
         tips = _overdue_tip_by_account(r)    # hover breakdown of overdue age
         tip_col = "Overdue"
     full_order = bucket_order + ["No due date"]
@@ -885,8 +973,13 @@ def render_aging_ledger(rows: pd.DataFrame, key: str,
     piv["Total"] = piv.sum(axis=1)
     # Payables: an account whose NET total is positive is a net advance — show the
     # whole balance in the Advance column and leave the aging buckets empty.
+    # Receivables: a NEGATIVE net total is a credit/advance received — same move.
     if sign == "payable":
         adv = piv["Total"] > 0
+        piv.loc[adv, full_order] = 0.0
+        piv.loc[adv, ADVANCE_COL] = piv.loc[adv, "Total"]
+    else:
+        adv = piv["Total"] < 0
         piv.loc[adv, full_order] = 0.0
         piv.loc[adv, ADVANCE_COL] = piv.loc[adv, "Total"]
     # Keep accounts + hide near-zero. When selecting by AccountType the rows are
@@ -902,6 +995,10 @@ def render_aging_ledger(rows: pd.DataFrame, key: str,
     # Drop "No due date" if it carries no amount anywhere (Overdue is always kept)
     if piv["No due date"].abs().sum() == 0:
         piv = piv.drop(columns="No due date")
+    # Receivables: drop the Advance column when no account has a credit balance.
+    if sign != "payable" and ADVANCE_COL in piv.columns \
+            and piv[ADVANCE_COL].abs().sum() == 0:
+        piv = piv.drop(columns=ADVANCE_COL)
     piv = piv.reset_index().rename(columns={"account_name": name_header})
 
     if piv.empty:
@@ -919,25 +1016,32 @@ def render_aging_ledger(rows: pd.DataFrame, key: str,
     piv["_ov_tip"] = piv[name_header].map(tips).fillna("")  # hover tooltip breakdown
     if sign == "payable":
         piv.loc[piv["Total"] > 0, "_ov_tip"] = ""  # advance accounts: no due-soon breakdown
+    else:
+        piv.loc[piv["Total"] < 0, "_ov_tip"] = ""  # advance accounts: no overdue breakdown
 
     # Due-date basis per account: "Actual" (DB due date), "Default" (default
     # credit-days applied because DB credit_days was 0/null), or "Mixed" (both).
     BASIS_COL = "Due date basis"
     if default_credit_days is not None:
         basis_by_acct = {}
+        cd_by_acct = {}
         for acct_name, sub_r in r.groupby("account_name"):
             cd = pd.to_numeric(sub_r["credit_days"], errors="coerce")
             missing = cd.isna() | (cd <= 0)
             if not missing.any():
-                basis_by_acct[acct_name] = "Actual"
+                basis = "Actual"
             elif missing.all():
-                basis_by_acct[acct_name] = "Default"
+                basis = "Default"
             else:
-                basis_by_acct[acct_name] = "Mixed"
+                basis = "Mixed"
+            basis_by_acct[acct_name] = basis
+            cd_by_acct[acct_name] = _credit_days_label(sub_r, basis, default_credit_days)
         piv[BASIS_COL] = piv[name_header].map(basis_by_acct).fillna("Actual")
+        piv[CREDIT_DAYS_COL] = piv[name_header].map(cd_by_acct).fillna("")
 
     num_cols = [c for c in piv.columns
-                if c not in (name_header, "_no_credit", "_ov_tip", BASIS_COL)]
+                if c not in (name_header, "_no_credit", "_ov_tip",
+                             BASIS_COL, CREDIT_DAYS_COL)]
     gb = GridOptionsBuilder.from_dataframe(piv)
     gb.configure_default_column(
         filter=True, floatingFilter=True, sortable=True, resizable=True,
@@ -987,6 +1091,10 @@ def render_aging_ledger(rows: pd.DataFrame, key: str,
                 " else { s.color='#3fb950'; } "
                 " return s; }"),
         )
+        # Credit-days used (after Due date basis).
+        gb.configure_column(CREDIT_DAYS_COL, maxWidth=130,
+                            headerClass="ag-center-header",
+                            cellStyle={"textAlign": "center"})
     grid_options = gb.build()
     # Allow selecting & copying cell text (e.g. the account name)
     grid_options["enableCellTextSelection"] = True
@@ -998,6 +1106,7 @@ def render_aging_ledger(rows: pd.DataFrame, key: str,
         total_row[c] = float(piv[c].sum())
     if default_credit_days is not None:
         total_row[BASIS_COL] = ""
+        total_row[CREDIT_DAYS_COL] = ""
     grid_options["pinnedTopRowData"] = [total_row]
     # Pinned TOTAL row = grey/bold; accounts with no credit terms = amber highlight
     grid_options["getRowStyle"] = JsCode(
@@ -1218,7 +1327,11 @@ def render_grouped_aging_ledger(rows: pd.DataFrame, key: str, group_map,
                                 group_label: str = "OEM",
                                 overdue_popup: bool = False,
                                 select_by_type: bool = False,
-                                unbilled_map: dict = None) -> None:
+                                unbilled_map: dict = None,
+                                unbilled_income_map: dict = None,
+                                unbilled_income_group_map: dict = None,
+                                unbilled_parties_df: pd.DataFrame = None,
+                                last_groups: list = None) -> None:
     """Aging ledger that lists ACTUAL account names, ordered by their group, with
     a bold subtotal row ("<group> - Total") inserted after each group's accounts.
 
@@ -1258,7 +1371,7 @@ def render_grouped_aging_ledger(rows: pd.DataFrame, key: str, group_map,
         full_order = [DUE_SOON_COL, ADVANCE_COL] + OVERDUE_COLS + ["No due date"]
     else:
         r["_bkt"] = r["_dtd"].apply(_make_bucketer(bins))
-        full_order = ["Overdue"] + [lbl for lbl, _ in bins] + ["No due date"]
+        full_order = ["Overdue", ADVANCE_COL] + [lbl for lbl, _ in bins] + ["No due date"]
     piv = (
         r.pivot_table(index=["_grp", "account_name"], columns="_bkt",
                       values="bal_amount", aggfunc="sum", fill_value=0.0)
@@ -1267,8 +1380,13 @@ def render_grouped_aging_ledger(rows: pd.DataFrame, key: str, group_map,
     piv["Total"] = piv.sum(axis=1)
     # Payables: accounts with a positive NET total are net advances — the whole
     # balance goes to the Advance column, aging buckets left empty.
+    # Receivables: a NEGATIVE net total is a credit/advance received — same move.
     if sign == "payable":
         adv = piv["Total"] > 0
+        piv.loc[adv, full_order] = 0.0
+        piv.loc[adv, ADVANCE_COL] = piv.loc[adv, "Total"]
+    else:
+        adv = piv["Total"] < 0
         piv.loc[adv, full_order] = 0.0
         piv.loc[adv, ADVANCE_COL] = piv.loc[adv, "Total"]
     # Keep near-zero accounts hidden. Selecting by AccountType keeps both net
@@ -1281,6 +1399,10 @@ def render_grouped_aging_ledger(rows: pd.DataFrame, key: str, group_map,
         piv = piv[piv["Total"] < -100]
     if piv["No due date"].abs().sum() == 0:
         piv = piv.drop(columns="No due date")
+    # Receivables: drop the Advance column when no account has a credit balance.
+    if sign != "payable" and ADVANCE_COL in piv.columns \
+            and piv[ADVANCE_COL].abs().sum() == 0:
+        piv = piv.drop(columns=ADVANCE_COL)
     piv = piv.reset_index()
 
     if piv.empty:
@@ -1309,62 +1431,125 @@ def render_grouped_aging_ledger(rows: pd.DataFrame, key: str, group_map,
     # credit-days applied because DB credit_days was 0/null), or "Mixed" (both).
     BASIS_COL = "Due date basis"
     basis_by_acct = {}
+    cd_by_acct = {}
     for acct_name, sub_r in r.groupby("account_name"):
         cd = pd.to_numeric(sub_r["credit_days"], errors="coerce")
         missing = cd.isna() | (cd <= 0)
         if apply_defaults:
-            has_def = _oem_default_credit_days(acct_name) is not None
+            default_val = _oem_default_credit_days(acct_name)
+            has_def = default_val is not None
         else:
+            default_val = default_credit_days
             has_def = default_credit_days is not None
         used_default = missing & has_def
         if not used_default.any():
-            basis_by_acct[acct_name] = "Actual"
+            basis = "Actual"
         elif used_default.all():
-            basis_by_acct[acct_name] = "Default"
+            basis = "Default"
         else:
-            basis_by_acct[acct_name] = "Mixed"
+            basis = "Mixed"
+        basis_by_acct[acct_name] = basis
+        cd_by_acct[acct_name] = _credit_days_label(sub_r, basis, default_val)
 
     # Precompute the hover-tooltip per account (payables: upcoming-window
     # breakdown; receivables: overdue day-range breakdown).
     tip_by_acct = (_due_soon_tip_by_account(r) if sign == "payable"
                    else _overdue_tip_by_account(r))
     tip_col = DUE_SOON_COL if sign == "payable" else "Overdue"
-    # Advance accounts (positive net) show 0 in due-soon, so no breakdown tooltip.
-    if sign == "payable":
-        adv_accts = set(piv.loc[piv["Total"] > 0, "account_name"])
-        for a in adv_accts:
-            tip_by_acct.pop(a, None)
+    # Advance accounts show 0 in the overdue/due-soon column, so no breakdown
+    # tooltip (payables: positive net; receivables: negative net).
+    adv_accts = set(piv.loc[(piv["Total"] > 0) if sign == "payable"
+                            else (piv["Total"] < 0), "account_name"])
+    for a in adv_accts:
+        tip_by_acct.pop(a, None)
 
     # Optional "Unbilled" column (Pump Vendors): net balance of each account's
     # matched control account, shown as the first numeric column.
     show_unbilled = unbilled_map is not None
     grand_unbilled = 0.0
 
+    # Optional "Unbilled Income" column (OEM Receivables): a per-group figure
+    # (from cn_data) shown only on the group subtotal + grand-total rows, placed
+    # as the last numeric column just before "Due date basis".
+    show_unbilled_income = unbilled_income_map is not None
+    grand_unbilled_income = 0.0   # headline total (group-level, matches collection)
+    grand_matched_income = 0.0    # sum attributed to listed accounts
+
     # Build the display frame: account rows per group, then a subtotal row.
-    grp_order = piv.groupby("_grp")["Total"].sum().sort_values(ascending=asc).index
+    grp_order = list(piv.groupby("_grp")["Total"].sum()
+                     .sort_values(ascending=asc).index)
+    # Force certain groups (e.g. "Cash & Others") to the end, in the given order.
+    for _lg in (last_groups or []):
+        if _lg in grp_order:
+            grp_order.remove(_lg)
+            grp_order.append(_lg)
+
+    # Unbilled-income hover tooltips: per-group billing-party breakdown (⚠ marks
+    # parties whose name doesn't match a listed account — the "extra" in the
+    # subtotal), plus a grand-total popup of all such unmatched parties.
+    ubi_tip_by_grp = {}
+    ubi_extra_parts = []   # (billing_party, amount) not matched to any listed row
+    if show_unbilled_income and unbilled_parties_df is not None:
+        shown_keys = {_party_key(a) for a in piv["account_name"]}
+        pf = unbilled_parties_df[
+            (unbilled_parties_df["unbilled"] > 0)
+            & (unbilled_parties_df["oem_group"].isin(list(grp_order)))
+        ]
+        for grp, subp in pf.groupby("oem_group"):
+            subp = subp.sort_values("unbilled", ascending=False)
+            lines = []
+            for p in subp.itertuples():
+                extra = p.party_key not in shown_keys
+                lines.append(f"{p.billing_party}: {inr(p.unbilled)}"
+                             + (" ⚠" if extra else ""))
+                if extra:
+                    ubi_extra_parts.append((p.billing_party, float(p.unbilled)))
+            ubi_tip_by_grp[grp] = (
+                "<b>Unbilled income — billing parties</b><br>"
+                + "<br>".join(lines)
+                + f"<br><b>Total: {inr(subp['unbilled'].sum())}</b>"
+                + "<br><i>⚠ not matched to an account row above</i>")
+
     display_rows = []
     for g in grp_order:
         sub = piv[piv["_grp"] == g].sort_values("Total", ascending=asc)
         grp_unbilled = 0.0
+        grp_income = 0.0
         for _, row in sub.iterrows():
             acct = row["account_name"]
             d = {name_header: acct, "_is_total": False,
                  "_no_credit": bool(no_credit.get(acct, False)),
-                 "_ov_tip": tip_by_acct.get(acct, "")}
+                 "_ov_tip": tip_by_acct.get(acct, ""), "_ubi_tip": ""}
             if show_unbilled:
                 unb = float(unbilled_map.get(_norm_name(acct), 0.0))
                 d["Unbilled"] = unb
                 grp_unbilled += unb
                 grand_unbilled += unb
             d.update({c: float(row[c]) for c in num_cols})
+            if show_unbilled_income:
+                # Account-wise: match the account name to its billing party.
+                inc = float(unbilled_income_map.get(_party_key(acct), 0.0))
+                d["Unbilled Income"] = inc if inc else None  # blank when no match
+                grp_income += inc
             d[BASIS_COL] = basis_by_acct.get(acct, "Actual")
+            d[CREDIT_DAYS_COL] = cd_by_acct.get(acct, "")
             display_rows.append(d)
         d = {name_header: f"{g} - Total", "_is_total": True, "_no_credit": False,
-             "_ov_tip": ""}
+             "_ov_tip": "", "_ubi_tip": ""}
         if show_unbilled:
             d["Unbilled"] = grp_unbilled
         d.update({c: float(sub[c].sum()) for c in num_cols})
+        if show_unbilled_income:
+            # Subtotal = authoritative group-level figure (matches the collection
+            # report) when a group map is given; else the sum of matched accounts.
+            grp_total_income = float(
+                (unbilled_income_group_map or {}).get(g, grp_income))
+            d["Unbilled Income"] = grp_total_income
+            d["_ubi_tip"] = ubi_tip_by_grp.get(g, "")
+            grand_unbilled_income += grp_total_income
+            grand_matched_income += grp_income
         d[BASIS_COL] = ""
+        d[CREDIT_DAYS_COL] = ""
         display_rows.append(d)
     disp = pd.DataFrame(display_rows)
 
@@ -1390,6 +1575,13 @@ def render_grouped_aging_ledger(rows: pd.DataFrame, key: str, group_map,
         gb.configure_column(
             "Unbilled", type=["numericColumn"], valueFormatter=inr_fmt,
             cellStyle={"textAlign": "center", "backgroundColor": "rgba(88,166,255,0.20)"})
+    # "Unbilled Income" (OEM Receivables): last numeric column before Due date
+    # basis. Hover a subtotal/total cell to see its billing-party breakdown.
+    if show_unbilled_income:
+        gb.configure_column(
+            "Unbilled Income", type=["numericColumn"], valueFormatter=inr_fmt,
+            tooltipField="_ubi_tip", tooltipComponent=_overdue_tooltip_component(),
+            cellStyle={"textAlign": "center", "backgroundColor": "rgba(88,166,255,0.15)"})
     # Tooltip cell (payables: "Due in coming weeks"; receivables: "Overdue"):
     # on hover show its day-range breakdown.
     if overdue_popup and tip_col in num_cols:
@@ -1398,6 +1590,7 @@ def render_grouped_aging_ledger(rows: pd.DataFrame, key: str, group_map,
             tooltipField="_ov_tip", tooltipComponent=_overdue_tooltip_component(),
         )
     gb.configure_column("_ov_tip", hide=True)
+    gb.configure_column("_ubi_tip", hide=True)
     # Due-date basis column at the end — colour-coded text (Actual/Default/Mixed),
     # centred header + values.
     gb.configure_column(
@@ -1411,6 +1604,10 @@ def render_grouped_aging_ledger(rows: pd.DataFrame, key: str, group_map,
             " else { s.color='#3fb950'; } "
             " return s; }"),
     )
+    # Credit-days used (after Due date basis).
+    gb.configure_column(CREDIT_DAYS_COL, maxWidth=130,
+                        headerClass="ag-center-header",
+                        cellStyle={"textAlign": "center"})
     gb.configure_column(name_header, minWidth=280, pinned="left")
     gb.configure_column("_is_total", hide=True)
     gb.configure_column("_no_credit", hide=True)
@@ -1425,7 +1622,18 @@ def render_grouped_aging_ledger(rows: pd.DataFrame, key: str, group_map,
     if show_unbilled:
         total_row["Unbilled"] = grand_unbilled
     total_row.update({c: float(piv[c].sum()) for c in num_cols})
+    if show_unbilled_income:
+        total_row["Unbilled Income"] = grand_unbilled_income
+        if ubi_extra_parts:
+            _ex = sorted(ubi_extra_parts, key=lambda x: -x[1])
+            total_row["_ubi_tip"] = (
+                "<b>Extra unbilled — not matched to any account row</b><br>"
+                + "<br>".join(f"{n}: {inr(a)}" for n, a in _ex)
+                + f"<br><b>Total extra: {inr(sum(a for _, a in _ex))}</b>")
+        else:
+            total_row["_ubi_tip"] = ""
     total_row[BASIS_COL] = ""
+    total_row[CREDIT_DAYS_COL] = ""
     grid_options["pinnedTopRowData"] = [total_row]
     # Pinned grand-total row = grey/bold; per-group subtotal rows = blue/bold;
     # accounts with no credit_days = amber (same as the other ledgers).
@@ -1437,7 +1645,7 @@ def render_grouped_aging_ledger(rows: pd.DataFrame, key: str, group_map,
         "}"
     )
 
-    if overdue_popup:
+    if overdue_popup or show_unbilled_income:
         _enable_overdue_tooltip(grid_options)
 
     grid_h = min(560, 84 + 30 * len(disp))  # shrink to fit; scroll if tall
@@ -1474,11 +1682,55 @@ def render_grouped_aging_ledger(rows: pd.DataFrame, key: str, group_map,
             "🔵 Blue rows are per-group subtotals."
         )
 
+    if show_unbilled_income:
+        unattributed = grand_unbilled_income - grand_matched_income
+        msg = (
+            f"ℹ️ **Unbilled Income** total **{inr(grand_unbilled_income)}** "
+            "(group-level, matches the Expected-Collection report). Account rows "
+            "show the amount matched name-wise to the cn_data billing party"
+        )
+        if unattributed > 1:
+            msg += (
+                f"; **{inr(unattributed)}** sits in the subtotals but isn't attributed "
+                "to any listed account (billing-party name differs)"
+            )
+        st.caption(msg + ".")
+
+        # Diagnostic: exactly which billing parties didn't match a listed account.
+        if unattributed > 1 and unbilled_parties_df is not None:
+            shown_keys = {_party_key(a) for a in piv["account_name"]}
+            um = unbilled_parties_df[
+                (~unbilled_parties_df["party_key"].isin(shown_keys))
+                & (unbilled_parties_df["unbilled"] > 0)
+            ].sort_values("unbilled", ascending=False)
+            with st.expander(
+                f"🔎 Unbilled income not matched to a listed account — "
+                f"{len(um):,} billing part(y/ies), {inr(unattributed)}",
+                expanded=False,
+            ):
+                st.caption(
+                    "These cn_data billing parties have unbilled income but no "
+                    "account row above shares their name. Likely causes: the "
+                    "billing-party name differs from the ledger account name, or "
+                    "that account has no open receivable balance so it isn't listed."
+                )
+                _um = um.rename(columns={
+                    "billing_party": "Billing Party (cn_data)",
+                    "oem_group": "OEM Group", "unbilled": "Unbilled Income"})
+                st.dataframe(
+                    _um[["Billing Party (cn_data)", "OEM Group", "Unbilled Income"]],
+                    use_container_width=True, hide_index=True,
+                    column_config={"Unbilled Income":
+                                   st.column_config.NumberColumn(format="%.0f")},
+                )
+
     dcol1, dcol2 = st.columns(2)
     with dcol1:
+        _hidden = [c for c in ("_is_total", "_no_credit", "_ov_tip", "_ubi_tip")
+                   if c in disp.columns]
         st.download_button(
             "⬇️ Download grouped aging ledger (CSV)",
-            disp.drop(columns=["_is_total", "_no_credit"]).to_csv(index=False).encode("utf-8"),
+            disp.drop(columns=_hidden).to_csv(index=False).encode("utf-8"),
             file_name=f"grouped_aging_ledger_{key}.csv",
             mime="text/csv",
             key=f"dl_grouped_aging_{key}",
@@ -1699,12 +1951,14 @@ def _oem_default_credit_days(name):
 
 
 @st.cache_data(ttl=600, show_spinner=False)
-def load_unbilled_income() -> dict:
-    """Unbilled income per OEM group from cn_data: basic_freight of trips that are
-    delivered (POD receipt present) but not yet invoiced (bill_no blank).
+def load_unbilled_parties() -> pd.DataFrame:
+    """Per-billing-party unbilled income from cn_data: basic_freight of trips that
+    are delivered (POD receipt present) but not yet invoiced (bill_no blank).
 
     Filters: active rows; drop TEST cn_no; drop the known bad Ranjeet Singh
-    Logistics / 65000 record. Grouped by billing_party -> OEM keyword group."""
+    Logistics / 65000 record. One row per billing_party with its OEM group, a
+    punctuation-insensitive match key, and the unbilled amount. This is the single
+    source the group / per-party / diagnostic views below all derive from."""
     d = pd.read_sql(
         "SELECT cn_no, billing_party, bill_no, pod_receipt_no, basic_freight, "
         "is_active FROM cn_data", get_engine())
@@ -1717,10 +1971,24 @@ def load_unbilled_income() -> dict:
     pod = base["pod_receipt_no"].astype("string")
     unb = base[(bn.isna() | (bn.str.strip() == ""))            # not yet invoiced
                & (pod.notna() & (pod.str.strip() != ""))]       # POD received
-    g = (unb.assign(_g=unb["billing_party"].map(_oem_group),
-                    _bf=pd.to_numeric(unb["basic_freight"], errors="coerce").fillna(0.0))
-         .groupby("_g")["_bf"].sum())
-    return g.to_dict()
+    out = (unb.assign(unbilled=pd.to_numeric(unb["basic_freight"], errors="coerce").fillna(0.0))
+           .groupby("billing_party", as_index=False)["unbilled"].sum())
+    out["oem_group"] = out["billing_party"].map(_oem_group)
+    out["party_key"] = out["billing_party"].map(_party_key)
+    return out
+
+
+def load_unbilled_income() -> dict:
+    """{OEM group -> unbilled basic_freight} — the group-level headline figure."""
+    df = load_unbilled_parties()
+    return df.groupby("oem_group")["unbilled"].sum().to_dict()
+
+
+def load_unbilled_income_by_party() -> dict:
+    """{party key -> unbilled basic_freight}, keyed via _party_key so it can be
+    matched account-name-wise against the ledger (punctuation-insensitive)."""
+    df = load_unbilled_parties()
+    return df.groupby("party_key")["unbilled"].sum().to_dict()
 
 
 def render_collection_report(oem_rows: pd.DataFrame, key: str = "collection") -> None:
@@ -1840,6 +2108,129 @@ def render_collection_report(oem_rows: pd.DataFrame, key: str = "collection") ->
     )
 
 
+def render_collection_received(oem_rows: pd.DataFrame, key: str = "received") -> None:
+    """Companion to the Expected-Collection report: payment-received vs outstanding
+    per OEM group for bills DUE on or before a user-chosen end date.
+
+    End-date filter keeps references whose (effective) due_date <= end date — the
+    same OEM default credit-days fill missing ones, matching the OEM table. Columns:
+    Bill Amount (ref_amount), Payment Received (amount_paid), Outstanding (bal_amount)."""
+    if oem_rows is None or oem_rows.empty:
+        st.info("No OEM receivable accounts.")
+        return
+    r = oem_rows.copy()
+    # Effective due date: apply OEM default credit-days where DB credit_days is 0/null.
+    cd = pd.to_numeric(r["credit_days"], errors="coerce")
+    missing = cd.isna() | (cd <= 0)
+    dflt = r["account_name"].map(_oem_default_credit_days)
+    use = missing & dflt.notna()
+    if use.any():
+        r.loc[use, "due_date"] = (r.loc[use, "ref_date"]
+                                  + pd.to_timedelta(dflt[use].astype(float), unit="D"))
+
+    _dmin = pd.to_datetime(r["due_date"]).min()
+    end_date = st.date_input(
+        "Show bills due on or before", value=TODAY.date(),
+        min_value=(None if pd.isna(_dmin) else _dmin.date()),
+        key=f"recv_end_{key}",
+        help="Payment received vs outstanding for all OEM bills due up to this date.")
+    end_ts = pd.Timestamp(end_date)
+
+    r = r[r["due_date"].notna() & (r["due_date"] <= end_ts)]
+    if r.empty:
+        st.info("No OEM bills are due on or before the selected date.")
+        return
+    r["_grp"] = r["account_name"].map(_oem_group)
+
+    g = (r.groupby("_grp").agg(
+            **{"Bill Amount": ("ref_amount", "sum"),
+               "Payment Received": ("amount_paid", "sum"),
+               "Outstanding": ("bal_amount", "sum")})
+         .reset_index().rename(columns={"_grp": "OEM Group"}))
+    order = [k for k in RECEIVABLE_KEEP_KEYWORDS if k in set(g["OEM Group"])]
+    g["_o"] = g["OEM Group"].map({k: i for i, k in enumerate(order)})
+    g = g.sort_values("_o").drop(columns="_o")
+    num = ["Bill Amount", "Payment Received", "Outstanding"]
+    tot = {"OEM Group": "TOTAL"}
+    for c in num:
+        tot[c] = float(g[c].sum())
+
+    # Hover the Outstanding cell -> "Overdue by age" breakdown of that group's
+    # outstanding (same popup style as the aging tables).
+    r["_dov"] = (TODAY - r["due_date"]).dt.days
+
+    def _os_tip(sub_r):
+        bd = _overdue_breakdown(sub_r)
+        parts = [f"{b.Aging}: {inr(b.Amount)} ({b.Refs})"
+                 for b in bd.itertuples() if b.Amount]
+        if not parts:
+            return ""
+        return ("<b>Overdue by age</b><br>" + "<br>".join(parts)
+                + f"<br><b>Total: {inr(bd['Amount'].sum())}</b>")
+
+    _overdue = r[r["_dov"] > 0]
+    os_tip_by_grp = {grp: _os_tip(sub_r) for grp, sub_r in _overdue.groupby("_grp")}
+    g["_os_tip"] = g["OEM Group"].map(os_tip_by_grp).fillna("")
+    tot["_os_tip"] = _os_tip(_overdue)
+
+    inr0 = JsCode(
+        "class {"
+        " init(p){"
+        "  this.eGui=document.createElement('span');"
+        "  var v=p.value;"
+        "  if(v==null||v===''){ this.eGui.textContent=''; return; }"
+        "  var n=Number(v);"
+        "  if(!n){ this.eGui.textContent='0'; return; }"
+        "  var full=Math.round(n).toLocaleString('en-IN',"
+        "{minimumFractionDigits:0,maximumFractionDigits:0});"
+        "  var Ln=Math.round(n/100000);"
+        "  if(Ln===0){ this.eGui.textContent=full; return; }"
+        "  var L=Ln.toLocaleString('en-IN',"
+        "{minimumFractionDigits:0,maximumFractionDigits:0});"
+        "  this.eGui.innerHTML=full+' <span style=\"color:#58a6ff\">('+L+' L)</span>';"
+        " }"
+        " getGui(){ return this.eGui; }"
+        "}")
+    gb = GridOptionsBuilder.from_dataframe(g)
+    gb.configure_default_column(sortable=False, filter=False, resizable=True, flex=1,
+                                cellStyle={"textAlign": "center"})
+    for c in num:
+        gb.configure_column(c, type=["numericColumn"], cellRenderer=inr0,
+                            cellStyle={"textAlign": "right"})
+    gb.configure_column("OEM Group", pinned="left", minWidth=150,
+                        cellStyle={"textAlign": "left", "fontWeight": "600"})
+    gb.configure_column("Payment Received", cellRenderer=inr0,
+                        cellStyle={"textAlign": "right",
+                                   "backgroundColor": "rgba(63,185,80,0.15)"})
+    gb.configure_column("Outstanding", type=["numericColumn"], cellRenderer=inr0,
+                        cellStyle={"textAlign": "right"},
+                        tooltipField="_os_tip",
+                        tooltipComponent=_overdue_tooltip_component())
+    gb.configure_column("_os_tip", hide=True)
+    go = gb.build()
+    go["pinnedTopRowData"] = [tot]
+    go["enableCellTextSelection"] = True
+    _enable_overdue_tooltip(go)
+    go["getRowStyle"] = JsCode(
+        "function(p){ if(p.node.rowPinned){ return {'fontWeight':'700',"
+        "'background':'rgba(120,120,120,0.18)'}; } }")
+    AgGrid(g, gridOptions=go, height=min(460, 95 + 34 * len(g)),
+           theme="streamlit", allow_unsafe_jscode=True, fit_columns_on_grid_load=True,
+           custom_css=AG_DARK_CSS, key=f"received_grid_{key}")
+    st.caption(f"Payment received vs outstanding for OEM bills due on/before "
+               f"{end_ts:%d/%m/%Y}. Bill Amount = Payment Received + Outstanding. "
+               "💡 Hover an **Outstanding** amount for its overdue-by-age breakdown.")
+    _disp = pd.concat([pd.DataFrame([tot]), g], ignore_index=True).drop(
+        columns=["_os_tip"], errors="ignore")
+    st.download_button(
+        "⬇️ Download received-vs-outstanding (CSV)",
+        _disp.to_csv(index=False).encode("utf-8"),
+        file_name=f"collection_received_{key}_{end_ts:%Y%m%d}.csv",
+        mime="text/csv",
+        key=f"dl_received_{key}",
+    )
+
+
 tab_all, tab_pay, tab_rec = st.tabs(
     ["All accounts", "Payables only (we owe)",
      "Receivables only (owed to us)"]
@@ -1856,19 +2247,23 @@ with tab_pay:
     names = pay_led["account_name"].fillna("")
     has_code = names.str.contains(CODE_PATTERN, case=False, regex=True)
     excl = _is_dedicated(pay_led)
+    is_extra = _is_pump_extra(pay_led)   # non-coded accounts shown in Pump Vendors
 
-    # Pump Vendors = carries an oil-company code (IOCL/BPCL/HPCL).
-    pump_mask = has_code & ~excl
+    # Pump Vendors = carries an oil-company code (IOCL/BPCL/HPCL), plus the named
+    # extra accounts (Cash Pump, etc.) grouped under "Cash & Others" at the end.
+    pump_mask = (has_code | is_extra) & ~excl
 
     st.markdown("### ⛽ Pump Vendors")
     st.caption("Grouped by oil company (BPCL / IOCL / HPCL) with a subtotal row per group. "
-               "**Unbilled** = net balance of each pump's matched control account.")
+               "**Unbilled** = net balance of each pump's matched control account. "
+               "Cash/other non-coded accounts are grouped under **Cash & Others**.")
     render_grouped_aging_ledger(pay_led[pump_mask], "payables_pump",
-                                group_map=_pump_group, bins=PAYABLE_BINS,
+                                group_map=_pump_group_ext, bins=PAYABLE_BINS,
                                 sign="payable", name_header="Account Name",
                                 default_credit_days=7, group_label="Oil company",
                                 overdue_popup=True, select_by_type=True,
-                                unbilled_map=_pump_unbilled_map(led))
+                                unbilled_map=_pump_unbilled_map(led),
+                                last_groups=["Cash & Others"])
 
     st.divider()
 
@@ -1884,7 +2279,7 @@ with tab_pay:
         for grp in group_order:
             if grp.strip().lower() in hidden_groups:
                 continue
-            sub = pay_led[(~has_code) & (grp_of == grp)]
+            sub = pay_led[(~has_code) & (grp_of == grp) & ~is_extra]
             # Hide the whole group if nothing to show now; auto-appears when data comes.
             if not _has_displayable_accounts(sub):
                 continue
@@ -1893,7 +2288,7 @@ with tab_pay:
                                 default_credit_days=7, select_by_type=True)
             st.divider()
         # Any non-pump account not present in the CSV mapping.
-        uncl = pay_led[(~has_code) & grp_of.isna()]
+        uncl = pay_led[(~has_code) & grp_of.isna() & ~is_extra]
         if _has_displayable_accounts(uncl):
             st.markdown("### 🏢 Vendors — Unclassified")
             st.caption("Current-Liabilities accounts not assigned to any group in Group.xlsx.")
@@ -1905,11 +2300,13 @@ with tab_pay:
                 "folder to split these into per-group tables. Showing the default split.")
         is_assoc = pay_led["account_name"].map(_norm_name).isin(ASSOCIATE_CREDITOR_NORM)
         st.markdown("### 🏢 Vendors (non-pump)")
-        render_aging_ledger(pay_led[(~has_code) & ~excl & ~is_assoc], "payables_vendor",
+        render_aging_ledger(pay_led[(~has_code) & ~excl & ~is_assoc & ~is_extra],
+                            "payables_vendor",
                             default_credit_days=7, select_by_type=True)
         st.divider()
         st.markdown("### 🤝 Associate Creditor")
-        render_aging_ledger(pay_led[(~has_code) & ~excl & is_assoc], "payables_assoc",
+        render_aging_ledger(pay_led[(~has_code) & ~excl & is_assoc & ~is_extra],
+                            "payables_assoc",
                             default_credit_days=7, select_by_type=True)
 
 with tab_rec:
@@ -1938,7 +2335,10 @@ with tab_rec:
                                 group_map=_oem_group, bins=RECEIVABLE_BINS,
                                 sign="receivable", name_header="Account Name",
                                 apply_defaults=True, overdue_popup=True,
-                                select_by_type=True)
+                                select_by_type=True,
+                                unbilled_income_map=load_unbilled_income_by_party(),
+                                unbilled_income_group_map=load_unbilled_income(),
+                                unbilled_parties_df=load_unbilled_parties())
 
     st.divider()
 
@@ -1964,7 +2364,15 @@ with tab_all:
     _rec_all = led[led["account_type"] == "Current Assets"]
     _oem_keep = _rec_all["account_name"].fillna("").str.contains(
         RECEIVABLE_KEEP_PATTERN, case=False, regex=True)
-    render_collection_report(_rec_all[_oem_keep & ~_is_dedicated(_rec_all)], "all")
+    _oem_src = _rec_all[_oem_keep & ~_is_dedicated(_rec_all)]
+    render_collection_report(_oem_src, "all")
+
+    st.divider()
+
+    st.markdown("### 💰 Payment Received vs Outstanding — OEM Receivables (till date)")
+    st.caption("Pick an end date; shows payment received vs outstanding per OEM group "
+               "for all bills due on or before that date.")
+    render_collection_received(_oem_src, "all")
 
     st.divider()
 
