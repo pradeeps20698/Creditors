@@ -89,6 +89,29 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# --------------------------------------------------------------------------- #
+# Access gate — only reachable via Swift Hub (valid ?s= session token), and
+# gated per-user at the tab / table / KPI level. Must run before any data loads.
+# Uses the hub's user DB via st.secrets["database"] (separate from the
+# swift_party_ref data DB below, which uses the flat PG* secrets).
+# --------------------------------------------------------------------------- #
+from swift_auth_child import require_dashboard_access
+from swift_db import user_can_see
+
+user = require_dashboard_access("creditors")
+
+
+def can(feature_key: str) -> bool:
+    """True if the logged-in user may see this tab/table/KPI.
+
+    Admins (and the localhost dev user) see everything; everyone else is
+    deny-by-default — they see only features explicitly granted in Swift Hub.
+    """
+    if user.get("role") == "admin":
+        return True
+    return user_can_see(user["email"], "creditors", feature_key)
+
+
 def _db_conf(key, env, default=None):
     """Read config from Streamlit secrets first, then env, then default."""
     try:
@@ -730,10 +753,14 @@ net = payables + receivables
 n_parties = int((_pay_incl | _rec_incl).sum())
 
 c1, c2, c3, c4 = st.columns(4)
-c1.metric("Payables (we owe)", inr(payables))
-c2.metric("Receivables (owed to us)", inr(receivables))
-c3.metric("Net balance", inr(net))
-c4.metric("Accounts (net ≠ 0)", f"{n_parties:,}")
+if can("kpi_payables"):
+    c1.metric("Payables (we owe)", inr(payables))
+if can("kpi_receivables"):
+    c2.metric("Receivables (owed to us)", inr(receivables))
+if can("kpi_net_balance"):
+    c3.metric("Net balance", inr(net))
+if can("kpi_accounts"):
+    c4.metric("Accounts (net ≠ 0)", f"{n_parties:,}")
 
 st.divider()
 
@@ -2275,6 +2302,9 @@ tab_all, tab_pay, tab_rec = st.tabs(
      "Receivables only (owed to us)"]
 )
 with tab_pay:
+  if not can("tab_payables"):
+    st.info("🔒 You don't have access to this tab. Contact an administrator.")
+  else:
     st.caption(
         "Net Outstanding split into due-date aging buckets — days overdue "
         f"(today {TODAY:%d/%m/%Y} − due_date). **Pump Vendors** = accounts with an "
@@ -2292,63 +2322,68 @@ with tab_pay:
     # extra accounts (Cash Pump, etc.) grouped under "Cash & Others" at the end.
     pump_mask = (has_code | is_extra) & ~excl
 
-    st.markdown("### ⛽ Pump Vendors")
-    st.caption("Grouped by oil company (BPCL / IOCL / HPCL) with a subtotal row per group. "
-               "**Unbilled** = net balance of each pump's matched control account. "
-               "Cash/other non-coded accounts are grouped under **Cash & Others**.")
-    render_grouped_aging_ledger(pay_led[pump_mask], "payables_pump",
-                                group_map=_pump_group_ext, bins=PAYABLE_BINS,
-                                sign="payable", name_header="Account Name",
-                                default_credit_days=7, group_label="Oil company",
-                                overdue_popup=True, select_by_type=True,
-                                unbilled_map=_pump_unbilled_map(led),
-                                last_groups=["Cash & Others"])
+    if can("table_pump_vendors"):
+        st.markdown("### ⛽ Pump Vendors")
+        st.caption("Grouped by oil company (BPCL / IOCL / HPCL) with a subtotal row per group. "
+                   "**Unbilled** = net balance of each pump's matched control account. "
+                   "Cash/other non-coded accounts are grouped under **Cash & Others**.")
+        render_grouped_aging_ledger(pay_led[pump_mask], "payables_pump",
+                                    group_map=_pump_group_ext, bins=PAYABLE_BINS,
+                                    sign="payable", name_header="Account Name",
+                                    default_credit_days=7, group_label="Oil company",
+                                    overdue_popup=True, select_by_type=True,
+                                    unbilled_map=_pump_unbilled_map(led),
+                                    last_groups=["Cash & Others"])
 
-    st.divider()
+        st.divider()
 
-    # Remaining (non-pump) Current-Liabilities accounts, split into one table per
-    # Group from vendor_groups.csv. ALL such accounts are grouped (see scope choice).
-    name_to_group, group_order = load_vendor_groups()
-    grp_of = pay_led["account_name"].map(lambda n: name_to_group.get(_norm_name(n)))
+    if can("table_vendor_groups"):
+        # Remaining (non-pump) Current-Liabilities accounts, split into one table per
+        # Group from vendor_groups.csv. ALL such accounts are grouped (see scope choice).
+        name_to_group, group_order = load_vendor_groups()
+        grp_of = pay_led["account_name"].map(lambda n: name_to_group.get(_norm_name(n)))
 
-    if group_order:
-        # Groups not shown as their own table in Payables (control accounts feed the
-        # Pump Vendors "Unbilled" column instead).
-        hidden_groups = {"creditors diesel control a/c"}
-        for grp in group_order:
-            if grp.strip().lower() in hidden_groups:
-                continue
-            sub = pay_led[(~has_code) & (grp_of == grp) & ~is_extra]
-            # Hide the whole group if nothing to show now; auto-appears when data comes.
-            if not _has_displayable_accounts(sub):
-                continue
-            st.markdown(f"### 📂 {grp}")
-            render_aging_ledger(sub, f"pay_grp_{_slug(grp)}",
+        if group_order:
+            # Groups not shown as their own table in Payables (control accounts feed the
+            # Pump Vendors "Unbilled" column instead).
+            hidden_groups = {"creditors diesel control a/c"}
+            for grp in group_order:
+                if grp.strip().lower() in hidden_groups:
+                    continue
+                sub = pay_led[(~has_code) & (grp_of == grp) & ~is_extra]
+                # Hide the whole group if nothing to show now; auto-appears when data comes.
+                if not _has_displayable_accounts(sub):
+                    continue
+                st.markdown(f"### 📂 {grp}")
+                render_aging_ledger(sub, f"pay_grp_{_slug(grp)}",
+                                    default_credit_days=7, select_by_type=True)
+                st.divider()
+            # Any non-pump account not present in the CSV mapping.
+            uncl = pay_led[(~has_code) & grp_of.isna() & ~is_extra]
+            if _has_displayable_accounts(uncl):
+                st.markdown("### 🏢 Vendors — Unclassified")
+                st.caption("Current-Liabilities accounts not assigned to any group in Group.xlsx.")
+                render_aging_ledger(uncl, "pay_grp_unclassified",
+                                    default_credit_days=7, select_by_type=True)
+        else:
+            # Fallback until vendor_groups.csv is added: Vendors + Associate Creditor.
+            st.info("Add **vendor_groups.csv** (columns: Group, Vendor Name) to the project "
+                    "folder to split these into per-group tables. Showing the default split.")
+            is_assoc = pay_led["account_name"].map(_norm_name).isin(ASSOCIATE_CREDITOR_NORM)
+            st.markdown("### 🏢 Vendors (non-pump)")
+            render_aging_ledger(pay_led[(~has_code) & ~excl & ~is_assoc & ~is_extra],
+                                "payables_vendor",
                                 default_credit_days=7, select_by_type=True)
             st.divider()
-        # Any non-pump account not present in the CSV mapping.
-        uncl = pay_led[(~has_code) & grp_of.isna() & ~is_extra]
-        if _has_displayable_accounts(uncl):
-            st.markdown("### 🏢 Vendors — Unclassified")
-            st.caption("Current-Liabilities accounts not assigned to any group in Group.xlsx.")
-            render_aging_ledger(uncl, "pay_grp_unclassified",
+            st.markdown("### 🤝 Associate Creditor")
+            render_aging_ledger(pay_led[(~has_code) & ~excl & is_assoc & ~is_extra],
+                                "payables_assoc",
                                 default_credit_days=7, select_by_type=True)
-    else:
-        # Fallback until vendor_groups.csv is added: Vendors + Associate Creditor.
-        st.info("Add **vendor_groups.csv** (columns: Group, Vendor Name) to the project "
-                "folder to split these into per-group tables. Showing the default split.")
-        is_assoc = pay_led["account_name"].map(_norm_name).isin(ASSOCIATE_CREDITOR_NORM)
-        st.markdown("### 🏢 Vendors (non-pump)")
-        render_aging_ledger(pay_led[(~has_code) & ~excl & ~is_assoc & ~is_extra],
-                            "payables_vendor",
-                            default_credit_days=7, select_by_type=True)
-        st.divider()
-        st.markdown("### 🤝 Associate Creditor")
-        render_aging_ledger(pay_led[(~has_code) & ~excl & is_assoc & ~is_extra],
-                            "payables_assoc",
-                            default_credit_days=7, select_by_type=True)
 
 with tab_rec:
+  if not can("tab_receivables"):
+    st.info("🔒 You don't have access to this tab. Contact an administrator.")
+  else:
     st.caption(
         "Net Outstanding split into due-date aging buckets — Overdue (past due) "
         f"plus amounts coming due in the next windows (today {TODAY:%d/%m/%Y})."
@@ -2361,66 +2396,73 @@ with tab_rec:
     is_keep = rec_led["account_name"].fillna("").str.contains(
         RECEIVABLE_KEEP_PATTERN, case=False, regex=True)
 
-    st.markdown("### 📥 OEM Accounts")
-    st.caption("Grouped by OEM: " + ", ".join(RECEIVABLE_KEEP_KEYWORDS))
-    st.caption(
-        "Default credit-days (used only where DB credit_days is 0/null) — "
-        "MAHINDRA: 18, Glovis India Pvt Ltd - Pune: 14, Tata: 7, "
-        "VALUEDRIVE: 15, PURERIDE: 15, Toyota: 10. Rows with a valid DB "
-        "credit_days keep their actual due date. The **Due date basis** column "
-        "shows 🟢 Actual (DB) · 🔵 Default · 🟠 Mixed."
-    )
-    render_grouped_aging_ledger(rec_led[is_keep & ~excl], "receivables",
-                                group_map=_oem_group, bins=RECEIVABLE_BINS,
-                                sign="receivable", name_header="Account Name",
-                                apply_defaults=True, overdue_popup=True,
-                                select_by_type=True,
-                                unbilled_income_map=load_unbilled_income_by_party(),
-                                unbilled_income_group_map=load_unbilled_income(),
-                                unbilled_parties_df=load_unbilled_parties())
+    if can("table_oem_accounts"):
+        st.markdown("### 📥 OEM Accounts")
+        st.caption("Grouped by OEM: " + ", ".join(RECEIVABLE_KEEP_KEYWORDS))
+        st.caption(
+            "Default credit-days (used only where DB credit_days is 0/null) — "
+            "MAHINDRA: 18, Glovis India Pvt Ltd - Pune: 14, Tata: 7, "
+            "VALUEDRIVE: 15, PURERIDE: 15, Toyota: 10. Rows with a valid DB "
+            "credit_days keep their actual due date. The **Due date basis** column "
+            "shows 🟢 Actual (DB) · 🔵 Default · 🟠 Mixed."
+        )
+        render_grouped_aging_ledger(rec_led[is_keep & ~excl], "receivables",
+                                    group_map=_oem_group, bins=RECEIVABLE_BINS,
+                                    sign="receivable", name_header="Account Name",
+                                    apply_defaults=True, overdue_popup=True,
+                                    select_by_type=True,
+                                    unbilled_income_map=load_unbilled_income_by_party(),
+                                    unbilled_income_group_map=load_unbilled_income(),
+                                    unbilled_parties_df=load_unbilled_parties())
 
-    st.divider()
+        st.divider()
 
-    st.markdown("### 📋 Market load Accounts")
-    render_aging_ledger(rec_led[~is_keep & ~excl], "receivables_split",
-                        bins=RECEIVABLE_BINS, sign="receivable",
-                        default_credit_days=7, select_by_type=True)
+    if can("table_market_load"):
+        st.markdown("### 📋 Market load Accounts")
+        render_aging_ledger(rec_led[~is_keep & ~excl], "receivables_split",
+                            bins=RECEIVABLE_BINS, sign="receivable",
+                            default_credit_days=7, select_by_type=True)
 
 with tab_all:
-    st.markdown("### 📊 Aging summary — Payables vs Receivables")
-    st.caption(
-        "Net outstanding split into due-date buckets — Overdue (past due) and amounts "
-        f"coming due next (today {TODAY:%d/%m/%Y}). Accounts with no DB `credit_days` "
-        "use a 7-day default. Classified by AccountType — totals match the KPI row."
-    )
-    render_aging_summary(df, "all", bins=RECEIVABLE_BINS)
-
-    st.divider()
-
-    st.markdown("### 📅 Expected Collection — OEM Receivables (week-wise)")
-    st.caption("Built from the OEM Accounts (Receivables) — expected collection per "
-               "OEM group across the coming calendar weeks.")
+  if not can("tab_all"):
+    st.info("🔒 You don't have access to this tab. Contact an administrator.")
+  else:
+    # Shared OEM source used by more than one section below, so it is computed
+    # once (ungated) — the collection tables break without it when the Expected
+    # Collection section happens to be hidden for this user.
     _rec_all = led[led["account_type"] == "Current Assets"]
     _oem_keep = _rec_all["account_name"].fillna("").str.contains(
         RECEIVABLE_KEEP_PATTERN, case=False, regex=True)
     _oem_src = _rec_all[_oem_keep & ~_is_dedicated(_rec_all)]
-    render_collection_report(_oem_src, "all")
 
-    st.divider()
+    if can("table_aging_summary"):
+        st.markdown("### 📊 Aging summary — Payables vs Receivables")
+        st.caption(
+            "Net outstanding split into due-date buckets — Overdue (past due) and amounts "
+            f"coming due next (today {TODAY:%d/%m/%Y}). Accounts with no DB `credit_days` "
+            "use a 7-day default. Classified by AccountType — totals match the KPI row."
+        )
+        render_aging_summary(df, "all", bins=RECEIVABLE_BINS)
+        st.divider()
 
-    st.markdown("### 💰 Payment Received vs Outstanding — OEM Receivables (till date)")
-    st.caption("Pick an end date; shows payment received vs outstanding per OEM group "
-               "for all bills due on or before that date.")
-    render_collection_received(_oem_src, "all")
+    if can("table_expected_collection"):
+        st.markdown("### 📅 Expected Collection — OEM Receivables (week-wise)")
+        st.caption("Built from the OEM Accounts (Receivables) — expected collection per "
+                   "OEM group across the coming calendar weeks.")
+        render_collection_report(_oem_src, "all")
+        st.divider()
 
-    st.divider()
+    if can("table_payment_vs_outstanding"):
+        st.markdown("### 💰 Payment Received vs Outstanding — OEM Receivables (till date)")
+        st.caption("Pick an end date; shows payment received vs outstanding per OEM group "
+                   "for all bills due on or before that date.")
+        render_collection_received(_oem_src, "all")
+        st.divider()
 
     # Full (KPI) frame kept for the aging chart so it matches the summary table.
     _summary_src = df
     # Charts / detail below exclude accounts that live in a dedicated tab.
     df = df[~_is_dedicated(df)]
-
-    st.divider()
 
     # ----------------------------------------------------------------------- #
     # Charts row 1
@@ -2428,39 +2470,41 @@ with tab_all:
     left, right = st.columns(2)
 
     with left:
-        st.subheader("Outstanding by office")
-        g = (
-            df.groupby("office", dropna=False)["outstanding"].sum()
-            .reset_index().sort_values("outstanding", ascending=False).head(15)
-        )
-        fig = px.bar(g, x="outstanding", y="office", orientation="h", text_auto=".2s")
-        fig.update_layout(yaxis={"categoryorder": "total ascending"}, height=420, margin=dict(l=0, r=0, t=10, b=0))
-        st.plotly_chart(fig, use_container_width=True)
+        if can("chart_outstanding_by_office"):
+            st.subheader("Outstanding by office")
+            g = (
+                df.groupby("office", dropna=False)["outstanding"].sum()
+                .reset_index().sort_values("outstanding", ascending=False).head(15)
+            )
+            fig = px.bar(g, x="outstanding", y="office", orientation="h", text_auto=".2s")
+            fig.update_layout(yaxis={"categoryorder": "total ascending"}, height=420, margin=dict(l=0, r=0, t=10, b=0))
+            st.plotly_chart(fig, use_container_width=True)
 
     with right:
-        st.subheader("Aging of outstanding")
-        st.caption("Same buckets and figures as the aging summary table above "
-                   "(classified by AccountType, with the 7-day default).")
-        summ, bucket_cols = aging_summary_frame(_summary_src,
-                                                bins=RECEIVABLE_BINS)
-        long = summ.melt(id_vars="Type", value_vars=bucket_cols,
-                         var_name="Bucket", value_name="Amount")
-        long["label"] = long["Amount"].map(inr)  # Indian Cr/L labels (match the table)
-        fig = px.bar(
-            long, x="Bucket", y="Amount", color="Type", barmode="group",
-            text="label",
-            category_orders={"Bucket": bucket_cols,
-                             "Type": ["Payables (we owe)",
-                                      "Receivables (owed to us)", "Net balance"]},
-            color_discrete_map={"Payables (we owe)": "#f85149",
-                                "Receivables (owed to us)": "#3fb950",
-                                "Net balance": "#8b949e"},
-        )
-        fig.update_traces(textposition="outside", cliponaxis=False)
-        fig.update_layout(height=420, xaxis_title="", legend_title="",
-                          legend=dict(orientation="h", y=1.12),
-                          margin=dict(l=0, r=0, t=10, b=0))
-        st.plotly_chart(fig, use_container_width=True)
+        if can("chart_aging_outstanding"):
+            st.subheader("Aging of outstanding")
+            st.caption("Same buckets and figures as the aging summary table above "
+                       "(classified by AccountType, with the 7-day default).")
+            summ, bucket_cols = aging_summary_frame(_summary_src,
+                                                    bins=RECEIVABLE_BINS)
+            long = summ.melt(id_vars="Type", value_vars=bucket_cols,
+                             var_name="Bucket", value_name="Amount")
+            long["label"] = long["Amount"].map(inr)  # Indian Cr/L labels (match the table)
+            fig = px.bar(
+                long, x="Bucket", y="Amount", color="Type", barmode="group",
+                text="label",
+                category_orders={"Bucket": bucket_cols,
+                                 "Type": ["Payables (we owe)",
+                                          "Receivables (owed to us)", "Net balance"]},
+                color_discrete_map={"Payables (we owe)": "#f85149",
+                                    "Receivables (owed to us)": "#3fb950",
+                                    "Net balance": "#8b949e"},
+            )
+            fig.update_traces(textposition="outside", cliponaxis=False)
+            fig.update_layout(height=420, xaxis_title="", legend_title="",
+                              legend=dict(orientation="h", y=1.12),
+                              margin=dict(l=0, r=0, t=10, b=0))
+            st.plotly_chart(fig, use_container_width=True)
 
     # ----------------------------------------------------------------------- #
     # Charts row 2
@@ -2468,39 +2512,41 @@ with tab_all:
     left, right = st.columns([1, 1])
 
     with left:
-        st.subheader("Split by category & type")
-        g = df.groupby(["category", "ref_type"])["outstanding"].sum().reset_index()
-        fig = px.sunburst(g, path=["category", "ref_type"], values="outstanding")
-        fig.update_layout(height=420, margin=dict(l=0, r=0, t=10, b=0))
-        st.plotly_chart(fig, use_container_width=True)
+        if can("chart_split_category"):
+            st.subheader("Split by category & type")
+            g = df.groupby(["category", "ref_type"])["outstanding"].sum().reset_index()
+            fig = px.sunburst(g, path=["category", "ref_type"], values="outstanding")
+            fig.update_layout(height=420, margin=dict(l=0, r=0, t=10, b=0))
+            st.plotly_chart(fig, use_container_width=True)
 
     with right:
-        st.subheader("Monthly reference amount trend")
-        t = df.dropna(subset=["ref_date"]).copy()
-        t["month"] = t["ref_date"].dt.to_period("M").dt.to_timestamp()
-        g = t.groupby(["month", "category"])["ref_amount"].sum().reset_index()
-        fig = px.line(g, x="month", y="ref_amount", color="category", markers=True)
-        fig.update_layout(height=420, xaxis_title="", legend_title="", margin=dict(l=0, r=0, t=10, b=0))
+        if can("chart_monthly_trend"):
+            st.subheader("Monthly reference amount trend")
+            t = df.dropna(subset=["ref_date"]).copy()
+            t["month"] = t["ref_date"].dt.to_period("M").dt.to_timestamp()
+            g = t.groupby(["month", "category"])["ref_amount"].sum().reset_index()
+            fig = px.line(g, x="month", y="ref_amount", color="category", markers=True)
+            fig.update_layout(height=420, xaxis_title="", legend_title="", margin=dict(l=0, r=0, t=10, b=0))
+            st.plotly_chart(fig, use_container_width=True)
+
+    if can("chart_top_parties"):
+        st.divider()
+        # ------------------------------------------------------------------- #
+        # Top parties
+        # ------------------------------------------------------------------- #
+        st.subheader("Top parties by outstanding")
+        tcol1, tcol2 = st.columns([1, 3])
+        topn = tcol1.slider("Show top N", 5, 30, 10)
+        top = (
+            df.groupby("account_name")
+            .agg(outstanding=("outstanding", "sum"),
+                 net=("bal_amount", "sum"),
+                 items=("invoice_ref_id", "count"),
+                 overdue=("is_overdue", "sum"))
+            .reset_index().sort_values("outstanding", ascending=False).head(topn)
+        )
+        fig = px.bar(top.sort_values("outstanding"), x="outstanding", y="account_name",
+                     orientation="h", text_auto=".2s", hover_data=["items", "overdue"])
+        fig.update_layout(height=max(320, topn * 26), yaxis_title="", xaxis_title="Outstanding",
+                          margin=dict(l=0, r=0, t=10, b=0))
         st.plotly_chart(fig, use_container_width=True)
-
-    st.divider()
-
-    # ----------------------------------------------------------------------- #
-    # Top parties
-    # ----------------------------------------------------------------------- #
-    st.subheader("Top parties by outstanding")
-    tcol1, tcol2 = st.columns([1, 3])
-    topn = tcol1.slider("Show top N", 5, 30, 10)
-    top = (
-        df.groupby("account_name")
-        .agg(outstanding=("outstanding", "sum"),
-             net=("bal_amount", "sum"),
-             items=("invoice_ref_id", "count"),
-             overdue=("is_overdue", "sum"))
-        .reset_index().sort_values("outstanding", ascending=False).head(topn)
-    )
-    fig = px.bar(top.sort_values("outstanding"), x="outstanding", y="account_name",
-                 orientation="h", text_auto=".2s", hover_data=["items", "overdue"])
-    fig.update_layout(height=max(320, topn * 26), yaxis_title="", xaxis_title="Outstanding",
-                      margin=dict(l=0, r=0, t=10, b=0))
-    st.plotly_chart(fig, use_container_width=True)
