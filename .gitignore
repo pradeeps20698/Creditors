@@ -13,6 +13,7 @@ env/
 # Streamlit
 .streamlit/secrets.toml
 streamlit.log
+streamlit_run.log
 
 # OS / editor
 .DS_Store

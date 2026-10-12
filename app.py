@@ -687,6 +687,47 @@ VENDOR_GROUP_OVERRIDES = {
     "p s auto parts": "Sundry Creditors",
 }
 
+# User-editable overrides saved from the sidebar "Reassign unclassified vendor"
+# tool (columns: account_name, group). Applied on top of both the Excel and the
+# hardcoded VENDOR_GROUP_OVERRIDES, so the latest sidebar reassignment wins.
+GROUP_OVERRIDE_CSV = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "vendor_group_overrides.csv")
+
+
+def load_group_overrides_file() -> dict:
+    """Sidebar-saved account->group overrides as {normalised name: group}."""
+    if not os.path.exists(GROUP_OVERRIDE_CSV):
+        return {}
+    try:
+        g = pd.read_csv(GROUP_OVERRIDE_CSV, dtype=str).fillna("")
+    except Exception:
+        return {}
+    out = {}
+    for _, r in g.iterrows():
+        nm = _norm_name(r.get("account_name", ""))
+        grp = str(r.get("group", "")).strip()
+        if nm and grp:
+            out[nm] = grp
+    return out
+
+
+def save_group_override(account_name: str, group: str) -> None:
+    """Append (or replace) an account->group override in the CSV. Keyed by the
+    normalised account name so re-assigning the same account updates in place."""
+    nm = str(account_name).strip()
+    grp = str(group).strip()
+    rows = []
+    if os.path.exists(GROUP_OVERRIDE_CSV):
+        try:
+            rows = pd.read_csv(GROUP_OVERRIDE_CSV, dtype=str).fillna("").to_dict("records")
+        except Exception:
+            rows = []
+    rows = [r for r in rows
+            if _norm_name(r.get("account_name", "")) != _norm_name(nm)]
+    rows.append({"account_name": nm, "group": grp})
+    pd.DataFrame(rows, columns=["account_name", "group"]).to_csv(
+        GROUP_OVERRIDE_CSV, index=False)
+
 
 @st.cache_data(ttl=600)
 def load_vendor_groups():
@@ -720,8 +761,12 @@ def load_vendor_groups():
         name_to_group[nm] = grp
         if grp not in order:
             order.append(grp)
-    # Manual overrides win over the file.
+    # Manual overrides win over the file; sidebar-saved overrides win over those.
     for nm, grp in VENDOR_GROUP_OVERRIDES.items():
+        name_to_group[nm] = grp
+        if grp not in order:
+            order.append(grp)
+    for nm, grp in load_group_overrides_file().items():
         name_to_group[nm] = grp
         if grp not in order:
             order.append(grp)
@@ -785,6 +830,34 @@ if f_div:
     led = led[led["division_name"].isin(f_div)]
 if f_reftype:
     led = led[led["ref_type"].isin(f_reftype)]
+
+# Sidebar tool: reassign a "Vendors — Unclassified" (Current-Liabilities) account
+# into one of the existing vendor groups. Open to anyone; the mapping is saved to
+# vendor_group_overrides.csv and takes effect across all Payables tables + the KPI.
+with st.sidebar.expander("🗂️ Reassign unclassified vendor", expanded=False):
+    _n2g, _gorder = load_vendor_groups()
+    _pl = led[led["account_type"] == "Current Liabilities"]
+    _pn = _pl["account_name"].fillna("")
+    _hc = _pn.str.contains(CODE_PATTERN, case=False, regex=True)
+    _gof = _pn.map(lambda n: _n2g.get(_norm_name(n)))
+    # Same filter as the "Vendors — Unclassified" table: non-coded, non-pump-extra,
+    # not in any group. Limit to accounts that actually show (|net| > 100).
+    _uncl = _pl[(~_hc) & _gof.isna() & ~_is_pump_extra(_pl)]
+    _net = _uncl.groupby("account_name")["bal_amount"].sum()
+    _uncl_names = sorted(_net[_net.abs() > 100].index.astype(str))
+    if not _gorder:
+        st.caption("No vendor groups defined yet (add Group.xlsx / vendor_groups.csv).")
+    elif not _uncl_names:
+        st.caption("No unclassified vendors to reassign 🎉")
+    else:
+        _acct = st.selectbox("Unclassified account", _uncl_names, key="uncl_acct")
+        _grp = st.selectbox("Move to group", _gorder, key="uncl_grp")
+        if st.button("Move account", use_container_width=True, key="uncl_move"):
+            save_group_override(_acct, _grp)
+            load_vendor_groups.clear()   # drop cached grouping so the move shows now
+            st.success(f"Moved '{_acct}' → {_grp}")
+            st.rerun()
+    st.caption(f"{len(_uncl_names)} unclassified. Saved to vendor_group_overrides.csv.")
 
 # Base aggregation — the All accounts ledger. Excludes accounts that belong to a
 # dedicated tab (Enroute vendors, Control-AC & others).
@@ -2417,11 +2490,20 @@ def render_collection_received(oem_rows: pd.DataFrame, key: str = "received") ->
     )
 
 
-tab_all, tab_pay, tab_rec = st.tabs(
-    ["All accounts", "Payables only (we owe)",
-     "Receivables only (owed to us)"]
-)
-with tab_pay:
+_VIEW_ALL = "All accounts"
+_VIEW_PAY = "Payables only (we owe)"
+_VIEW_REC = "Receivables only (owed to us)"
+# Persistent top-level view selector. st.tabs resets to the first tab on every
+# rerun (grid search / sort / filter, sidebar actions), which kept throwing users
+# back to "All accounts". A keyed segmented_control keeps the chosen view across
+# reruns via session_state.
+_active_view = st.segmented_control(
+    "View", [_VIEW_ALL, _VIEW_PAY, _VIEW_REC],
+    default=_VIEW_ALL, key="main_view", label_visibility="collapsed")
+if _active_view is None:
+    _active_view = _VIEW_ALL
+
+if _active_view == _VIEW_PAY:
   if not can("tab_payables"):
     st.info("🔒 You don't have access to this tab. Contact an administrator.")
   else:
@@ -2500,7 +2582,7 @@ with tab_pay:
                                 "payables_assoc",
                                 default_credit_days=7, select_by_type=True)
 
-with tab_rec:
+if _active_view == _VIEW_REC:
   if not can("tab_receivables"):
     st.info("🔒 You don't have access to this tab. Contact an administrator.")
   else:
@@ -2546,7 +2628,7 @@ with tab_rec:
                             bins=RECEIVABLE_BINS, sign="receivable",
                             default_credit_days=7, select_by_type=True)
 
-with tab_all:
+if _active_view == _VIEW_ALL:
   if not can("tab_all"):
     st.info("🔒 You don't have access to this tab. Contact an administrator.")
   else:
