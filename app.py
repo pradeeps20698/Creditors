@@ -1431,6 +1431,9 @@ def render_grouped_aging_ledger(rows: pd.DataFrame, key: str, group_map,
                 r.loc[missing, "ref_date"]
                 + pd.to_timedelta(float(default_credit_days), unit="D")
             )
+    if sign == "receivable":
+        r = _apply_toyota_month_end(r)  # Toyota: due date = ref_date's month-end
+        r = _apply_honda_cycle(r)       # Honda: 1–8 -> 21st, 9+ -> month-end
     r["_dtd"] = (r["due_date"] - TODAY).dt.days
     if sign == "payable":
         r["_bkt"] = r["_dtd"].apply(_bucket_by_due)
@@ -1499,6 +1502,16 @@ def render_grouped_aging_ledger(rows: pd.DataFrame, key: str, group_map,
     basis_by_acct = {}
     cd_by_acct = {}
     for acct_name, sub_r in r.groupby("account_name"):
+        # Toyota (receivables): due date = ref_date's month-end, not a credit-days rule.
+        if sign == "receivable" and _oem_group(acct_name) == "Toyota":
+            basis_by_acct[acct_name] = "Month-end"
+            cd_by_acct[acct_name] = "Month-end"
+            continue
+        # Honda (receivables): billing-cycle rule (1–8 -> 21st, 9+ -> month-end).
+        if sign == "receivable" and _oem_group(acct_name) == "Honda":
+            basis_by_acct[acct_name] = "Billing cycle"
+            cd_by_acct[acct_name] = "1–8→21 · 9+→ME"
+            continue
         cd = pd.to_numeric(sub_r["credit_days"], errors="coerce")
         missing = cd.isna() | (cd <= 0)
         if apply_defaults:
@@ -1667,6 +1680,8 @@ def render_grouped_aging_ledger(rows: pd.DataFrame, key: str, group_map,
             " if(!p.value) return s; "
             " if(p.value=='Default'){ s.color='#4aa3ff'; s.fontWeight='600'; } "
             " else if(p.value=='Mixed'){ s.color='#d29922'; s.fontWeight='600'; } "
+            " else if(p.value=='Month-end'){ s.color='#a371f7'; s.fontWeight='600'; } "
+            " else if(p.value=='Billing cycle'){ s.color='#39c5cf'; s.fontWeight='600'; } "
             " else { s.color='#3fb950'; } "
             " return s; }"),
     )
@@ -1834,6 +1849,8 @@ def aging_summary_frame(rows: pd.DataFrame, bins=RECEIVABLE_BINS,
                 r.loc[missing, "ref_date"]
                 + pd.to_timedelta(float(default_credit_days), unit="D")
             )
+    r = _apply_toyota_month_end(r)  # Toyota receivables: due date = ref_date's month-end
+    r = _apply_honda_cycle(r)       # Honda receivables: 1–8 -> 21st, 9+ -> month-end
     r["_bkt"] = (r["due_date"] - TODAY).dt.days.apply(_make_bucketer(bins))
     full_order = ["Overdue"] + future_cols + ["No due date"]
     piv = (
@@ -1997,6 +2014,60 @@ def _oem_group(name: str) -> str:
     return "Other"
 
 
+# Glovis is reported as three separate entities — KIA / Chennai / Pune — plus a
+# "Glovis - Total" subtotal, in the OEM collection tables ONLY. Everywhere else it
+# stays a single "Glovis" group (see _oem_group).
+GLOVIS_SUBGROUPS = [
+    "Glovis India Pvt Ltd - KIA",
+    "Glovis India Pvt Ltd - Chennai",
+    "Glovis India Pvt Ltd - Pune",
+]
+GLOVIS_TOTAL_LABEL = "Glovis - Total"
+
+
+def _oem_group_split(name: str) -> str:
+    """Like _oem_group, but Glovis accounts resolve to their specific entity
+    (KIA / Chennai / Pune) so the OEM collection tables can list them separately.
+    Any other Glovis account falls back to the plain 'Glovis' group."""
+    low = str(name).lower()
+    if "glovis" in low:
+        if "kia" in low:
+            return GLOVIS_SUBGROUPS[0]
+        if "chennai" in low:
+            return GLOVIS_SUBGROUPS[1]
+        if "pune" in low:
+            return GLOVIS_SUBGROUPS[2]
+        return "Glovis"
+    return _oem_group(name)
+
+
+def _collection_group_order():
+    """RECEIVABLE_KEEP_KEYWORDS order with 'Glovis' expanded into its sub-entities,
+    used to order rows in the OEM collection tables."""
+    order = []
+    for k in RECEIVABLE_KEEP_KEYWORDS:
+        order.extend(GLOVIS_SUBGROUPS if k == "Glovis" else [k])
+    return order
+
+
+def _insert_glovis_subtotal(df, num_cols, group_col="OEM Group", extra=None):
+    """Insert a 'Glovis - Total' subtotal row (sum of num_cols) right after the
+    Glovis sub-entity rows of df. No-op if no Glovis sub-entities are present."""
+    df = df.reset_index(drop=True)
+    mask = df[group_col].isin(GLOVIS_SUBGROUPS)
+    if not mask.any():
+        return df
+    glv = df[mask]
+    sub = {group_col: GLOVIS_TOTAL_LABEL}
+    for c in num_cols:
+        sub[c] = float(pd.to_numeric(glv[c], errors="coerce").fillna(0.0).sum())
+    if extra:
+        sub.update(extra)
+    last = int(mask[mask].index.max())
+    return pd.concat([df.iloc[:last + 1], pd.DataFrame([sub]), df.iloc[last + 1:]],
+                     ignore_index=True)
+
+
 # Default credit_days for the OEM Accounts table ONLY, used when the DB
 # credit_days is zero/null. Keyed by OEM group; a per-account entry (exact name,
 # lower-cased) overrides the group default. Due date = ref_date + these days.
@@ -2014,6 +2085,34 @@ def _oem_default_credit_days(name):
     if low in OEM_DEFAULT_CREDIT_DAYS_BY_ACCOUNT:
         return OEM_DEFAULT_CREDIT_DAYS_BY_ACCOUNT[low]
     return OEM_DEFAULT_CREDIT_DAYS.get(_oem_group(name))
+
+
+def _apply_toyota_month_end(r):
+    """Toyota-only due-date rule (overrides credit-days): due date = the LAST day of
+    the month its ref_date falls in. Current-month bills then land in this month's
+    week buckets; past-month bills are already overdue and fold into Old Collection.
+    Mutates and returns the given frame."""
+    is_toy = r["account_name"].map(_oem_group) == "Toyota"
+    if is_toy.any():
+        r.loc[is_toy, "due_date"] = (
+            pd.to_datetime(r.loc[is_toy, "ref_date"]) + pd.offsets.MonthEnd(0)
+        ).dt.normalize()
+    return r
+
+
+def _apply_honda_cycle(r):
+    """Honda-only billing-cycle due-date rule (overrides credit-days), by ref_date's
+    day of month: days 1–8 are due on the 21st of that month; day 9 onward is due at
+    that month's end. Past-month bills are already overdue -> Old Collection.
+    Mutates and returns the given frame."""
+    is_hon = r["account_name"].map(_oem_group) == "Honda"
+    if is_hon.any():
+        ref = pd.to_datetime(r.loc[is_hon, "ref_date"])
+        month_start = ref.dt.normalize() - pd.to_timedelta(ref.dt.day - 1, unit="D")
+        twentyfirst = month_start + pd.Timedelta(days=20)        # 1st + 20 = 21st
+        month_end = (ref + pd.offsets.MonthEnd(0)).dt.normalize()
+        r.loc[is_hon, "due_date"] = twentyfirst.where(ref.dt.day <= 8, month_end)
+    return r
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -2076,7 +2175,9 @@ def render_collection_report(oem_rows: pd.DataFrame, key: str = "collection") ->
     if use.any():
         r.loc[use, "due_date"] = (r.loc[use, "ref_date"]
                                   + pd.to_timedelta(dflt[use].astype(float), unit="D"))
-    r["_grp"] = r["account_name"].map(_oem_group)
+    r = _apply_toyota_month_end(r)  # Toyota: due date = ref_date's month-end
+    r = _apply_honda_cycle(r)       # Honda: 1–8 -> 21st, 9+ -> month-end
+    r["_grp"] = r["account_name"].map(_oem_group_split)
 
     N = 4  # calendar weeks shown (current + next 3); rest -> "Later"
     monday = (TODAY - pd.Timedelta(days=int(TODAY.weekday()))).normalize()
@@ -2106,16 +2207,23 @@ def render_collection_report(oem_rows: pd.DataFrame, key: str = "collection") ->
                          aggfunc="sum", fill_value=0.0)
            .reindex(columns=col_keys, fill_value=0.0))
     piv.columns = labels
-    order = [k for k in RECEIVABLE_KEEP_KEYWORDS if k in piv.index]
+    order = [k for k in _collection_group_order() if k in piv.index]
     piv = piv.reindex(order)
     piv["Total"] = piv.sum(axis=1)
     piv = piv.reset_index().rename(columns={"_grp": "OEM Group"})
-    _unb = load_unbilled_income()  # OEM group -> unbilled basic_freight (from cn_data)
+    # Unbilled income keyed by the SAME split grouping so each Glovis entity gets
+    # its own figure (cn_data billing_party -> split OEM group).
+    _unb_df = load_unbilled_parties()
+    _unb = (_unb_df.assign(_g=_unb_df["billing_party"].map(_oem_group_split))
+            .groupby("_g")["unbilled"].sum().to_dict())
     piv["Unbilled Income"] = piv["OEM Group"].map(lambda g: float(_unb.get(g, 0.0)))
     num = labels + ["Total", "Unbilled Income"]
     tot = {"OEM Group": "TOTAL"}
     for c in num:
         tot[c] = float(piv[c].sum())
+    # Glovis sub-entities roll up into a "Glovis - Total" subtotal row (added after
+    # the grand TOTAL is computed, so it is not double-counted).
+    piv = _insert_glovis_subtotal(piv, num)
 
     inr0 = JsCode(
         "class {"
@@ -2150,8 +2258,10 @@ def render_collection_report(oem_rows: pd.DataFrame, key: str = "collection") ->
     go["enableCellTextSelection"] = True
     go["getRowStyle"] = JsCode(
         "function(p){ if(p.node.rowPinned){ return {'fontWeight':'700',"
-        "'background':'rgba(120,120,120,0.18)'}; } }")
-    AgGrid(piv, gridOptions=go, height=min(460, 95 + 34 * len(piv)),
+        "'background':'rgba(120,120,120,0.18)'}; }"
+        " if(p.data && p.data['OEM Group']==='Glovis - Total'){ return {'fontWeight':'700',"
+        "'background':'rgba(88,166,255,0.12)'}; } }")
+    AgGrid(piv, gridOptions=go, height=112 + 30 * len(piv),  # fit all rows, no scroll
            theme="streamlit", allow_unsafe_jscode=True, fit_columns_on_grid_load=True,
            custom_css=AG_DARK_CSS, key=f"collection_grid_{key}")
     st.caption(f"Expected collection by calendar week (Mon–Sun). Overdue amounts fold "
@@ -2193,6 +2303,8 @@ def render_collection_received(oem_rows: pd.DataFrame, key: str = "received") ->
     if use.any():
         r.loc[use, "due_date"] = (r.loc[use, "ref_date"]
                                   + pd.to_timedelta(dflt[use].astype(float), unit="D"))
+    r = _apply_toyota_month_end(r)  # Toyota: due date = ref_date's month-end
+    r = _apply_honda_cycle(r)       # Honda: 1–8 -> 21st, 9+ -> month-end
 
     _dmin = pd.to_datetime(r["due_date"]).min()
     end_date = st.date_input(
@@ -2206,14 +2318,14 @@ def render_collection_received(oem_rows: pd.DataFrame, key: str = "received") ->
     if r.empty:
         st.info("No OEM bills are due on or before the selected date.")
         return
-    r["_grp"] = r["account_name"].map(_oem_group)
+    r["_grp"] = r["account_name"].map(_oem_group_split)
 
     g = (r.groupby("_grp").agg(
             **{"Bill Amount": ("ref_amount", "sum"),
                "Payment Received": ("amount_paid", "sum"),
                "Outstanding": ("bal_amount", "sum")})
          .reset_index().rename(columns={"_grp": "OEM Group"}))
-    order = [k for k in RECEIVABLE_KEEP_KEYWORDS if k in set(g["OEM Group"])]
+    order = [k for k in _collection_group_order() if k in set(g["OEM Group"])]
     g["_o"] = g["OEM Group"].map({k: i for i, k in enumerate(order)})
     g = g.sort_values("_o").drop(columns="_o")
     num = ["Bill Amount", "Payment Received", "Outstanding"]
@@ -2238,6 +2350,12 @@ def render_collection_received(oem_rows: pd.DataFrame, key: str = "received") ->
     os_tip_by_grp = {grp: _os_tip(sub_r) for grp, sub_r in _overdue.groupby("_grp")}
     g["_os_tip"] = g["OEM Group"].map(os_tip_by_grp).fillna("")
     tot["_os_tip"] = _os_tip(_overdue)
+    # Glovis sub-entities roll up into a "Glovis - Total" subtotal row (after TOTAL
+    # is computed above, so it is not double-counted). Its Outstanding hover shows
+    # the combined overdue-by-age breakdown of the three Glovis entities.
+    _glv_overdue = _overdue[_overdue["_grp"].isin(GLOVIS_SUBGROUPS)]
+    g = _insert_glovis_subtotal(
+        g, num, extra={"_os_tip": _os_tip(_glv_overdue) if not _glv_overdue.empty else ""})
 
     inr0 = JsCode(
         "class {"
@@ -2279,8 +2397,10 @@ def render_collection_received(oem_rows: pd.DataFrame, key: str = "received") ->
     _enable_overdue_tooltip(go)
     go["getRowStyle"] = JsCode(
         "function(p){ if(p.node.rowPinned){ return {'fontWeight':'700',"
-        "'background':'rgba(120,120,120,0.18)'}; } }")
-    AgGrid(g, gridOptions=go, height=min(460, 95 + 34 * len(g)),
+        "'background':'rgba(120,120,120,0.18)'}; }"
+        " if(p.data && p.data['OEM Group']==='Glovis - Total'){ return {'fontWeight':'700',"
+        "'background':'rgba(88,166,255,0.12)'}; } }")
+    AgGrid(g, gridOptions=go, height=112 + 30 * len(g),  # fit all rows, no scroll
            theme="streamlit", allow_unsafe_jscode=True, fit_columns_on_grid_load=True,
            custom_css=AG_DARK_CSS, key=f"received_grid_{key}")
     st.caption(f"Payment received vs outstanding for OEM bills due on/before "
@@ -2402,9 +2522,12 @@ with tab_rec:
         st.caption(
             "Default credit-days (used only where DB credit_days is 0/null) — "
             "MAHINDRA: 18, Glovis India Pvt Ltd - Pune: 14, Tata: 7, "
-            "VALUEDRIVE: 15, PURERIDE: 15, Toyota: 10. Rows with a valid DB "
-            "credit_days keep their actual due date. The **Due date basis** column "
-            "shows 🟢 Actual (DB) · 🔵 Default · 🟠 Mixed."
+            "VALUEDRIVE: 15, PURERIDE: 15. **Toyota** uses a month-end rule: due "
+            "date = last day of the bill's ref-date month. **Honda** uses a billing "
+            "cycle: ref-date on the 1st–8th → due 21st; 9th onward → due month-end "
+            "(prior-month bills are overdue). Other rows with a valid DB credit_days "
+            "keep their actual due date. The **Due date basis** column shows 🟢 Actual "
+            "(DB) · 🔵 Default · 🟠 Mixed · 🗓️ Month-end (Toyota) · 🔁 Billing cycle (Honda)."
         )
         render_grouped_aging_ledger(rec_led[is_keep & ~excl], "receivables",
                                     group_map=_oem_group, bins=RECEIVABLE_BINS,
